@@ -352,17 +352,18 @@ export const acquireServerSingleton = Effect.fn("serverSingleton.acquire")(funct
         // The message names `server-runtime.json` (not `server.lock`) as the
         // file to remove if the process is gone — that is all a pre-lock
         // server ever wrote.
-        Effect.catchTag("LiveLegacyServerRuntime", (legacy) =>
-          Effect.fail(
-            new ServerAlreadyRunningError({
-              stateDir,
-              lockPath: legacyRuntimeStatePath,
-              holderPid: legacy.state.pid,
-              holderPort: legacy.state.port,
-              holderStartedAt: legacy.state.startedAt,
-            }),
-          ),
-        ),
+        Effect.catchTags({
+          LiveLegacyServerRuntime: (legacy) =>
+            Effect.fail(
+              new ServerAlreadyRunningError({
+                stateDir,
+                lockPath: legacyRuntimeStatePath,
+                holderPid: legacy.state.pid,
+                holderPort: legacy.state.port,
+                holderStartedAt: legacy.state.startedAt,
+              }),
+            ),
+        }),
       );
       if (failure !== undefined) return yield* failure;
       yield* holdServerLock(lockPath);
