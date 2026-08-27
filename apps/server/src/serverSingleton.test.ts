@@ -257,6 +257,9 @@ layer("serverSingleton", (it) => {
         const date = DateTime.toDateUtc(now);
         yield* fs.utimes(lockPath, date, date);
       }).pipe(
+        // Per-round catch, the same way the production heartbeat recovers:
+        // `Effect.repeat` ends a failing effect on the first failure.
+        Effect.catch(() => Effect.void),
         Effect.repeat({ schedule: Schedule.spaced(50), while: () => true }),
         Effect.catch(() => Effect.void),
       );

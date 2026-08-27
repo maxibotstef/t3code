@@ -285,19 +285,21 @@ const claimLock = Effect.fn("serverSingleton.claimLock")(function* (input: {
  */
 const holdServerLock = Effect.fn("serverSingleton.hold")(function* (lockPath: string) {
   const fs = yield* FileSystem.FileSystem;
-  // `Effect.repeat` with a spaced schedule (rather than `Effect.schedule`) so
-  // a failure wakes the loop on the next tick instead of terminating it: the
-  // holder must keep refreshing for as long as it owns the lock, through
-  // whatever transient filesystem errors come and go.
+  const tick = Effect.gen(function* () {
+    const holder = yield* readHolder(lockPath);
+    if (holder === undefined || holder.pid !== process.pid) return;
+    const now = yield* DateTime.now;
+    const date = DateTime.toDateUtc(now);
+    yield* fs.utimes(lockPath, date, date);
+  });
   const reschedule = Schedule.spaced(RECLAIM_OBSERVATION_DELAY_MILLIS);
   yield* Effect.forkScoped(
-    Effect.gen(function* () {
-      const holder = yield* readHolder(lockPath);
-      if (holder === undefined || holder.pid !== process.pid) return;
-      const now = yield* DateTime.now;
-      const date = DateTime.toDateUtc(now);
-      yield* fs.utimes(lockPath, date, date);
-    }).pipe(
+    tick.pipe(
+      // Each tick is caught individually: `Effect.repeat` ends a failing
+      // effect on the first failure, so recovery has to live inside the round.
+      // The holder keeps refreshing for as long as it owns the lock, through
+      // whatever transient filesystem errors come and go.
+      Effect.catch(() => Effect.void),
       Effect.repeat({ schedule: reschedule, while: () => true }),
       Effect.catch(() => Effect.void),
     ),
