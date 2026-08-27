@@ -98,13 +98,9 @@ layer("serverSingleton", (it) => {
       );
       yield* fs.utimes(lockPath, past, past);
 
-      // The first claim observes the dead holder for several rounds, reclaims
-      // it, and returns the retry signal; the very next start wins the freed
-      // directory. A crashed server must cost its successor one restart, not a
-      // permanent block.
-      const exhausted = yield* Effect.scoped(acquireServerSingleton(stateDir)).pipe(Effect.flip);
-      assert.strictEqual(exhausted._tag, "ServerLockUnavailableError");
-
+      // One call observes the dead holder for several rounds, reclaims it, and
+      // claims the freed directory on the same pass: a crashed server costs
+      // its successor one delayed start, not one failed manual retry.
       yield* Effect.scoped(
         Effect.gen(function* () {
           const held = yield* acquireServerSingleton(stateDir);
@@ -124,9 +120,6 @@ layer("serverSingleton", (it) => {
         DateTime.subtractDuration(yield* DateTime.now, Duration.minutes(1)),
       );
       yield* fs.utimes(lockPath, past, past);
-
-      const exhausted = yield* Effect.scoped(acquireServerSingleton(stateDir)).pipe(Effect.flip);
-      assert.strictEqual(exhausted._tag, "ServerLockUnavailableError");
 
       yield* Effect.scoped(
         Effect.gen(function* () {

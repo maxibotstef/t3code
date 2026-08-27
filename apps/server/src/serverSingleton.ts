@@ -107,6 +107,12 @@ export class ServerLockUnavailableError extends Schema.TaggedErrorClass<ServerLo
   }
 }
 
+// How many reclaim-and-retry rounds against a confirmed-dead lock a starter
+// tolerates before concluding something else keeps recreating it: nothing a
+// real dead holder produces, everything a permission wall or a competing
+// starter produces.
+const MAX_RECLAIM_CYCLES = 3;
+
 /**
  * Whether a pid is a live process.
  *
@@ -197,8 +203,10 @@ const claimLock = Effect.fn("serverSingleton.claimLock")(function* (input: {
   yield* fs.makeDirectory(path.dirname(input.lockPath), { recursive: true });
 
   // Counts how often this starter was forced to refresh a candidate stale lock
-  // before believing it is really dead (see the constants above).
+  // before believing it is really dead, and how often a confirmed-dead lock
+  // bounced it back to another round (see the constants above).
   let reclaimRefreshes = 0;
+  let reclaimCycles = 0;
   while (true) {
     // A scheduler yield between attempts, so a reclaim observation round lets
     // other starters (and the holder's heartbeat) run before this starter
@@ -224,31 +232,48 @@ const claimLock = Effect.fn("serverSingleton.claimLock")(function* (input: {
       });
     }
 
+    // The read found no live owner — either a decodeable dead holder, or
+    // `undefined` because the file is missing (another starter mid-reclaim)
+    // or undecodable (a crash tore a write in half). Never unlink after one
+    // read: between this starter's read and its remove, a successor can win
+    // the re-race and recreate its own live lock, and the unlink would delete
+    // that. The candidate is mtime-refreshed and re-observed across
+    // `MAX_CLAIM_ATTEMPTS` rounds, and only a file that stayed untouched
+    // through every round is removed — a live successor's heartbeat always
+    // refreshes inside one round, so the file a reclaimer finally removes is
+    // provably still dead. The wait lands in the *next* loop head's
+    // `Effect.yieldNow`, which keeps `claimLock` real-time-only so tests can
+    // drive it without a fake clock.
     if (reclaimRefreshes >= MAX_CLAIM_ATTEMPTS) {
-      // The lock stayed untouched across every observation round, which only a
-      // dead holder allows — a live one's heartbeat always refreshes inside
-      // one round. Removing it now frees the directory for the winner of the
-      // next create, and cannot delete a successor's claim.
+      // Removing frees the directory, and the create is retried on the next
+      // pass: a cleanly restarted server after a crash claims its directory
+      // here, not on a later manual retry. Bounded, so a lock another starter
+      // keeps recreating (or a permissions wall keeps failing to remove for)
+      // still surfaces as itself.
       yield* fs.remove(input.lockPath, { force: true });
-      return new ServerLockUnavailableError({
-        lockPath: input.lockPath,
-        attempts: reclaimRefreshes,
-      });
+      reclaimRefreshes = 0;
+      reclaimCycles += 1;
+      if (reclaimCycles >= MAX_RECLAIM_CYCLES) {
+        return new ServerLockUnavailableError({
+          lockPath: input.lockPath,
+          attempts: reclaimCycles,
+        });
+      }
+      continue;
     }
 
-    // Owner is gone, or the file is unreadable because a crash tore a write
-    // in half. Never unlink unconditionally: between this starter's read and
-    // its remove, a successor can win the re-race and recreate its own live
-    // lock, and the unlink would delete that. Reclaim instead refreshes the
-    // file's mtime once per observation round and only removes it after it has
-    // stayed untouched across `MAX_CLAIM_ATTEMPTS` rounds — a live
-    // successor's heartbeat always refreshes inside that window, so the file
-    // this starter removes is provably still a dead one's. The wait lands in
-    // the *next* loop head's `Effect.yieldNow`, which keeps `claimLock`
-    // real-time-only so tests can drive it without a fake clock.
     reclaimRefreshes += 1;
     const now = yield* DateTime.now;
-    yield* fs.utimes(input.lockPath, DateTime.toDateUtc(now), DateTime.toDateUtc(now));
+    // NotFound-tolerant: a shutdown mid-release can drop the file between our
+    // read and our refresh, and the starter that released it is nobody's live
+    // claim either way. The next pass's create or re-read settles it.
+    yield* fs
+      .utimes(input.lockPath, DateTime.toDateUtc(now), DateTime.toDateUtc(now))
+      .pipe(
+        Effect.catch((error) =>
+          error.reason._tag === "NotFound" ? Effect.void : Effect.fail(error),
+        ),
+      );
   }
 });
 
