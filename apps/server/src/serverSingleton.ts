@@ -23,7 +23,7 @@
  * liveness is checked with signal 0. The tradeoff is honest: if a server is
  * killed and its pid is later reused by an unrelated process, this refuses to
  * start until the file is removed. That is the safe direction to fail, and the
- * message names the file so recovery is one `rm`.
+ * message names the file for recovery after the reported pid is checked.
  *
  * ## Upgrading from a pre-lock version
  *
@@ -41,7 +41,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 
 import { writeFileStringAtomically } from "./atomicWrite.ts";
@@ -145,17 +144,6 @@ const readHolder = Effect.fn("serverSingleton.readHolder")(function* (lockPath: 
   return Option.getOrUndefined(decodeHolder(raw));
 });
 
-// A dead holder's lock is not unlinked outright: between one starter reading a
-// stale lock and another recreating it, an unconditional unlink would remove a
-// live successor's claim. Reclamation instead refreshes the file's mtime
-// `MAX_CLAIM_ATTEMPTS` times; only a file that stays the same dead content
-// across every attempt is removed, so a live recreation always survives. The
-// holder bumps the mtime once between attempts while it owns the lock, so no
-// sequence of slower starters can reclaim out from under it either — and a
-// dead holder still recycles its lock inside a second of startup time.
-const MAX_CLAIM_ATTEMPTS = 3;
-const RECLAIM_OBSERVATION_DELAY_MILLIS = 200;
-
 const isAlreadyExists = (error: PlatformError.PlatformError): boolean =>
   error.reason._tag === "AlreadyExists";
 
@@ -205,16 +193,10 @@ const claimLock = Effect.fn("serverSingleton.claimLock")(function* (input: {
 
   yield* fs.makeDirectory(path.dirname(input.lockPath), { recursive: true });
 
-  // Counts how often this starter was forced to refresh a candidate stale lock
-  // before believing it is really dead, and how often a confirmed-dead lock
-  // bounced it back to another round (see the constants above).
-  let reclaimRefreshes = 0;
   let reclaimCycles = 0;
   while (true) {
-    // A scheduler yield between attempts, so a reclaim observation round lets
-    // other starters (and the holder's heartbeat) run before this starter
-    // concludes a lock never changed. Real time only — resolvable under
-    // `TestClock`.
+    // Let a competing starter or a just-created lock finish its write before
+    // inspecting the current owner.
     yield* Effect.yieldNow;
     const created = yield* fs.writeFileString(input.lockPath, payload, { flag: "wx" }).pipe(
       Effect.as(true),
@@ -235,78 +217,24 @@ const claimLock = Effect.fn("serverSingleton.claimLock")(function* (input: {
       });
     }
 
-    // The read found no live owner — either a decodeable dead holder, or
-    // `undefined` because the file is missing (another starter mid-reclaim)
-    // or undecodable (a crash tore a write in half). Never unlink after one
-    // read: between this starter's read and its remove, a successor can win
-    // the re-race and recreate its own live lock, and the unlink would delete
-    // that. The candidate is mtime-refreshed and re-observed across
-    // `MAX_CLAIM_ATTEMPTS` rounds, and only a file that stayed untouched
-    // through every round is removed — a live successor's heartbeat always
-    // refreshes inside one round, so the file a reclaimer finally removes is
-    // provably still dead. The wait lands in the *next* loop head's
-    // `Effect.yieldNow`, which keeps `claimLock` real-time-only so tests can
-    // drive it without a fake clock.
-    if (reclaimRefreshes >= MAX_CLAIM_ATTEMPTS) {
-      // Removing frees the directory, and the create is retried on the next
-      // pass: a cleanly restarted server after a crash claims its directory
-      // here, not on a later manual retry. Bounded, so a lock another starter
-      // keeps recreating (or a permissions wall keeps failing to remove for)
-      // still surfaces as itself.
-      yield* fs.remove(input.lockPath, { force: true });
-      reclaimRefreshes = 0;
-      reclaimCycles += 1;
-      if (reclaimCycles >= MAX_RECLAIM_CYCLES) {
-        return new ServerLockUnavailableError({
-          lockPath: input.lockPath,
-          attempts: reclaimCycles,
-        });
-      }
+    // Re-read after yielding before removal. A live writer that was still
+    // finishing its exclusive-create payload, or another starter that won a
+    // preceding reclaim, is then observed and preserved.
+    yield* Effect.yieldNow;
+    const confirmedHolder = yield* readHolder(input.lockPath);
+    if (confirmedHolder !== undefined && processIsAlive(confirmedHolder.pid)) {
       continue;
     }
 
-    reclaimRefreshes += 1;
-    const now = yield* DateTime.now;
-    // NotFound-tolerant: a shutdown mid-release can drop the file between our
-    // read and our refresh, and the starter that released it is nobody's live
-    // claim either way. The next pass's create or re-read settles it.
-    yield* fs
-      .utimes(input.lockPath, DateTime.toDateUtc(now), DateTime.toDateUtc(now))
-      .pipe(
-        Effect.catch((error) =>
-          error.reason._tag === "NotFound" ? Effect.void : Effect.fail(error),
-        ),
-      );
+    yield* fs.remove(input.lockPath, { force: true });
+    reclaimCycles += 1;
+    if (reclaimCycles >= MAX_RECLAIM_CYCLES) {
+      return new ServerLockUnavailableError({
+        lockPath: input.lockPath,
+        attempts: reclaimCycles,
+      });
+    }
   }
-});
-
-/**
- * A live lock holder refreshes its claim's mtime once per reclaim-observation
- * round while it owns the lock. Any starter mid-reclaim then sees the file
- * change and backs off, so the holder's lock cannot be reclaimed from under it
- * no matter how many starters race. Stops with the scope that holds the lock.
- */
-const holdServerLock = Effect.fn("serverSingleton.hold")(function* (lockPath: string) {
-  const fs = yield* FileSystem.FileSystem;
-  const tick = Effect.gen(function* () {
-    const holder = yield* readHolder(lockPath);
-    if (holder === undefined || holder.pid !== process.pid) return;
-    const now = yield* DateTime.now;
-    const date = DateTime.toDateUtc(now);
-    yield* fs.utimes(lockPath, date, date);
-  });
-  const reschedule = Schedule.spaced(RECLAIM_OBSERVATION_DELAY_MILLIS);
-  yield* Effect.forkScoped(
-    tick.pipe(
-      // Each tick is caught individually: `Effect.repeat` ends a failing
-      // effect on the first failure, so recovery has to live inside the round.
-      // The holder keeps refreshing for as long as it owns the lock, through
-      // whatever transient filesystem errors come and go.
-      Effect.catch(() => Effect.void),
-      Effect.repeat({ schedule: reschedule, while: () => true }),
-      Effect.catch(() => Effect.void),
-    ),
-  );
 });
 
 /**
@@ -396,7 +324,6 @@ export const acquireServerSingleton = Effect.fn("serverSingleton.acquire")(funct
         }),
       );
       if (failure !== undefined) return yield* failure;
-      yield* holdServerLock(lockPath);
       return lockPath;
     }),
     () => releaseServerLock(lockPath).pipe(Effect.ignore),

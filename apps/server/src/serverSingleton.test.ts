@@ -1,11 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import * as DateTime from "effect/DateTime";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 
 import { PersistedServerRuntimeState } from "./serverRuntimeState.ts";
@@ -90,17 +87,9 @@ layer("serverSingleton", (it) => {
       // pid 2^22 is above every /proc/sys/kernel/pid_max default, so it cannot
       // be live. A crashed server must not lock its own directory forever.
       yield* fs.writeFileString(lockPath, staleHolder(4194304));
-      // Age the mtime past the holder's heartbeat interval: reclaim may take a
-      // few observation rounds before it is believed dead, and those must never
-      // be confused with a live holder's own refresh.
-      const past = DateTime.toDateUtc(
-        DateTime.subtractDuration(yield* DateTime.now, Duration.minutes(1)),
-      );
-      yield* fs.utimes(lockPath, past, past);
 
-      // One call observes the dead holder for several rounds, reclaims it, and
-      // claims the freed directory on the same pass: a crashed server costs
-      // its successor one delayed start, not one failed manual retry.
+      // One call confirms the dead holder, reclaims it, and claims the freed
+      // directory on the same pass.
       yield* Effect.scoped(
         Effect.gen(function* () {
           const held = yield* acquireServerSingleton(stateDir);
@@ -116,10 +105,6 @@ layer("serverSingleton", (it) => {
       const fs = yield* FileSystem.FileSystem;
       const lockPath = yield* serverLockPath(stateDir);
       yield* fs.writeFileString(lockPath, '{"version":1,"pid":');
-      const past = DateTime.toDateUtc(
-        DateTime.subtractDuration(yield* DateTime.now, Duration.minutes(1)),
-      );
-      yield* fs.utimes(lockPath, past, past);
 
       yield* Effect.scoped(
         Effect.gen(function* () {
@@ -244,41 +229,39 @@ layer("serverSingleton", (it) => {
     }),
   );
 
+  it.effect("claims the directory when legacy runtime state is corrupt", () =>
+    Effect.gen(function* () {
+      const stateDir = yield* makeStateDir();
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      yield* fs.writeFileString(
+        path.join(stateDir, SERVER_RUNTIME_STATE_FILENAME),
+        '{"version":1,"pid":',
+      );
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const held = yield* acquireServerSingleton(stateDir);
+          assert.strictEqual(held, yield* serverLockPath(stateDir));
+        }),
+      );
+    }),
+  );
+
   it.effect("a starter cannot reclaim a lock a live holder still owns", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const fs = yield* FileSystem.FileSystem;
       const lockPath = yield* serverLockPath(stateDir);
 
-      // Starter B holds the directory live, with the heartbeat this change
-      // gives every live holder. Starter A runs the full claim loop against
-      // it — the loop whose old unconditional unlink deleted B's claim here.
+      // Starter B holds the directory live. Starter A must refuse rather than
+      // remove B's claim.
       yield* fs.writeFileString(
         lockPath,
         `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
       );
-      const past = DateTime.toDateUtc(
-        DateTime.subtractDuration(yield* DateTime.now, Duration.minutes(1)),
-      );
-      yield* fs.utimes(lockPath, past, past);
-
-      const heartbeat = Effect.gen(function* () {
-        const now = yield* DateTime.now;
-        const date = DateTime.toDateUtc(now);
-        yield* fs.utimes(lockPath, date, date);
-      }).pipe(
-        // Per-round catch, the same way the production heartbeat recovers:
-        // `Effect.repeat` ends a failing effect on the first failure.
-        Effect.catch(() => Effect.void),
-        Effect.repeat({ schedule: Schedule.spaced(50), while: () => true }),
-        Effect.catch(() => Effect.void),
-      );
-
       yield* Effect.scoped(
         Effect.gen(function* () {
-          yield* Effect.forkScoped(heartbeat);
-          yield* Effect.yieldNow;
-
           // Undecodable-by-design: B's pid is live, so A must refuse. Before
           // the fix, A's unconditional reclaim deleted B's lock and A owned
           // the directory alongside B.
@@ -306,10 +289,6 @@ layer("serverSingleton", (it) => {
         lockPath,
         `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
       );
-      const past = DateTime.toDateUtc(
-        DateTime.subtractDuration(yield* DateTime.now, Duration.minutes(1)),
-      );
-      yield* fs.utimes(lockPath, past, past);
 
       const failure = yield* acquireServerSingleton(stateDir).pipe(Effect.flip);
 
