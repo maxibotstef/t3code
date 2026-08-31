@@ -190,10 +190,10 @@ const RelayClientLive = Layer.unwrap(
 /**
  * Claims the data directory before anything binds a port or opens the database.
  *
- * Provided once around the combined runtime-services + HTTP-server layer rather
- * than merged alongside it so the ordering is structural: the lock is a dependency
- * of everything it protects, and a second server cannot open persistence/provider
- * state or reach a listening socket while another holds the directory.
+ * Provided once into `HttpServerLive`, which is then provided into the runtime
+ * services. That dependency chain makes the ordering structural: claim the state
+ * directory, bind HTTP, then open persistence/provider state. A second server
+ * cannot reach either protected phase while another holds the directory.
  */
 const ServerSingletonLive = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -698,9 +698,9 @@ export const makeServerLayer = Layer.unwrap(
         { concurrency: "unbounded" },
       ).pipe(Effect.asVoid),
     }).pipe(Layer.provideMerge(RuntimeDependenciesLive), Layer.provide(launcherLayer));
+    const ownedHttpServerLive = HttpServerLive.pipe(Layer.provide(ServerSingletonLive));
     const ownedRuntimeServicesLive = runtimeServicesLive.pipe(
-      Layer.provideMerge(HttpServerLive),
-      Layer.provide(ServerSingletonLive),
+      Layer.provideMerge(ownedHttpServerLive),
     );
 
     const routesLayer = HttpRouter.serve(makeRoutesLayer.pipe(Layer.provide(launcherLayer)), {

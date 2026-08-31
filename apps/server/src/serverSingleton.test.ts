@@ -2,9 +2,12 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import * as ServerConfig from "./config.ts";
+import { makeServerLayer } from "./server.ts";
 import { PersistedServerRuntimeState } from "./serverRuntimeState.ts";
 import {
   SERVER_LOCK_FILENAME,
@@ -42,6 +45,27 @@ const legacyRuntimeState = (pid: number, port: number) =>
   })}\n`;
 
 layer("serverSingleton", (it) => {
+  it.effect("the full server layer refuses before opening persistence", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectory({ prefix: "t3-singleton-server-layer-" });
+      const stateDir = path.join(baseDir, "userdata");
+      yield* fs.makeDirectory(stateDir, { recursive: true });
+      yield* fs.writeFileString(
+        path.join(stateDir, SERVER_LOCK_FILENAME),
+        `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
+      );
+
+      const failure = yield* Layer.build(
+        makeServerLayer.pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), baseDir))),
+      ).pipe(Effect.scoped, Effect.flip);
+
+      assert.strictEqual(failure._tag, "ServerAlreadyRunningError");
+      assert.isFalse(yield* fs.exists(path.join(stateDir, "state.sqlite")));
+    }),
+  );
+
   it.effect("claims a free directory and releases it on scope exit", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
