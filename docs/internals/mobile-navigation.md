@@ -51,13 +51,12 @@ use a separate implementation and do not need this workaround.
 
 ## Native media presentations
 
-`PresentationSource` in `NativePresentation` registers a thumbnail for AVKit's
-full-screen entry and UIKit's share sheet. Wrap the thumbnail as its single child
+`PresentationSource` in `NativePresentation` registers a thumbnail for AVKit,
+image zoom transitions, and UIKit's share sheet. Wrap the thumbnail as its single child
 and pass the stable identifier to the presentation. The registry keeps weak
 references to source views; recycled or compact composer thumbnails can register
 the same identifier. Identifiers must distinguish simultaneously visible attachments.
-This source registration does not own playback and can be reused by a future image
-viewer. Android uses a regular view.
+The source registration does not own the preview. Android uses a regular view.
 
 On iOS, video previews mount `AVPlayerViewController` temporarily inside the
 registered source and enter full screen through AVKit. AVKit
@@ -67,7 +66,24 @@ simulator, that leaves native Close unable to exit full screen. When the source 
 the player uses a standard modal presentation. Programmatic entry uses the same
 guarded `enterFullScreenAnimated:completionHandler:` selector as Expo Video;
 if that selector is unavailable, the player also falls back to a standard modal.
-Images retain their existing viewer.
+
+`FilePreviewModal` resolves image and PDF sources from a URI, a signed environment asset,
+or a retained composer file. On iOS, static images use `UIImageView` inside `UIScrollView`,
+with standard navigation-bar Close and Share items. The image is decoded before presentation
+so UIKit's iOS 18+ `preferredTransition` can zoom from the thumbnail into visible content.
+Quick Look delays image rendering until after presentation, leaving a blank zoom destination.
+It remains the viewer for PDFs and animated images, providing document search and sharing.
+Missing sources, older systems, and Reduce Motion use a standard presentation.
+
+The shared native presenter copies original bytes into its own temporary directory and
+removes that copy after dismissal. Network downloads write to disk, and sharing never edits
+the source attachment. Draft images use their stored upload data rather than a potentially
+expired picker URI. No React Navigation route or custom transition animator is needed.
+
+The same viewer handles message images, markdown images, PDF attachments and links,
+composer thumbnails, and workspace image previews. The workspace PDF web preview has an
+Open PDF action for the native viewer. Android retains its image viewer and uses the
+system chooser for PDFs. Saving images on iOS uses the add-only photo-library permission.
 
 Received videos open directly from their signed asset URL. AVKit handles buffering;
 the client does not download the entire file or show a separate opening overlay before
