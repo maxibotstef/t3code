@@ -190,11 +190,10 @@ const RelayClientLive = Layer.unwrap(
 /**
  * Claims the data directory before anything binds a port or opens the database.
  *
- * Provided into both the runtime services and `HttpServerLive` rather than merged
- * alongside them so the ordering is structural: the lock is a dependency of the
- * things it protects, and a second server cannot open persistence/provider state
- * or reach a listening socket while another holds the directory. Effect memoizes
- * this shared layer within the server graph, so both branches use one held claim.
+ * Provided once around the combined runtime-services + HTTP-server layer rather
+ * than merged alongside it so the ordering is structural: the lock is a dependency
+ * of everything it protects, and a second server cannot open persistence/provider
+ * state or reach a listening socket while another holds the directory.
  */
 const ServerSingletonLive = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -698,9 +697,9 @@ export const makeServerLayer = Layer.unwrap(
         ],
         { concurrency: "unbounded" },
       ).pipe(Effect.asVoid),
-    }).pipe(
-      Layer.provideMerge(RuntimeDependenciesLive),
-      Layer.provide(launcherLayer),
+    }).pipe(Layer.provideMerge(RuntimeDependenciesLive), Layer.provide(launcherLayer));
+    const ownedRuntimeServicesLive = runtimeServicesLive.pipe(
+      Layer.provideMerge(HttpServerLive),
       Layer.provide(ServerSingletonLive),
     );
 
@@ -716,10 +715,9 @@ export const makeServerLayer = Layer.unwrap(
     );
 
     return serverApplicationLayer.pipe(
-      Layer.provideMerge(runtimeServicesLive),
+      Layer.provideMerge(ownedRuntimeServicesLive),
       Layer.provide(activationLayer),
       Layer.provideMerge(serverRelayBrokerTracingLayer),
-      Layer.provideMerge(HttpServerLive.pipe(Layer.provide(ServerSingletonLive))),
       Layer.provide(ApplicationObservabilityLive),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provideMerge(VcsProcess.layer),

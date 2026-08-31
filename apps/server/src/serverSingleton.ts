@@ -89,7 +89,8 @@ export class ServerAlreadyRunningError extends Schema.TaggedErrorClass<ServerAlr
       "and settings.json. Stop the running server, or start this one with a",
       "different --base-dir.",
       "",
-      `If that process is gone, remove ${this.lockPath} and start again.`,
+      "Dead owners are reclaimed automatically on retry. If this message persists",
+      `after that pid is gone, confirm the pid was not reused before removing ${this.lockPath}.`,
     ].join("\n");
   }
 }
@@ -99,7 +100,6 @@ export class ServerLockUnavailableError extends Schema.TaggedErrorClass<ServerLo
   {
     lockPath: Schema.String,
     attempts: Schema.Int,
-    cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
@@ -120,15 +120,18 @@ const MAX_RECLAIM_CYCLES = 3;
  * server started under a different user is exactly the case that must not be
  * trampled.
  */
-export const processIsAlive = (pid: number): boolean => {
+export const processIsAliveWith = (pid: number, sendSignal: (pid: number) => void): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    process.kill(pid, 0);
+    sendSignal(pid);
     return true;
   } catch (cause) {
     return (cause as NodeJS.ErrnoException).code === "EPERM";
   }
 };
+
+export const processIsAlive = (pid: number): boolean =>
+  processIsAliveWith(pid, (targetPid) => process.kill(targetPid, 0));
 
 const readHolder = Effect.fn("serverSingleton.readHolder")(function* (lockPath: string) {
   const fs = yield* FileSystem.FileSystem;

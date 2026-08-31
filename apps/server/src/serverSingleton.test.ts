@@ -14,6 +14,7 @@ import {
   SERVER_RUNTIME_STATE_FILENAME,
   acquireServerSingleton,
   processIsAlive,
+  processIsAliveWith,
   recordServerLockPort,
   releaseServerLock,
   serverLockPath,
@@ -187,6 +188,16 @@ layer("serverSingleton", (it) => {
     assert.isFalse(processIsAlive(4194304));
     assert.isFalse(processIsAlive(0));
     assert.isFalse(processIsAlive(-1));
+    assert.isTrue(
+      processIsAliveWith(123, () => {
+        throw Object.assign(new Error("not permitted"), { code: "EPERM" });
+      }),
+    );
+    assert.isFalse(
+      processIsAliveWith(123, () => {
+        throw Object.assign(new Error("not found"), { code: "ESRCH" });
+      }),
+    );
   });
 
   it.effect("refuses next to a live pre-lock server that wrote no lock", () =>
@@ -283,16 +294,14 @@ layer("serverSingleton", (it) => {
     }),
   );
 
-  it.effect("reclaims a stale lock without unlinking a concurrently live successor", () =>
+  it.effect("does not unlink a live holder encountered during reclaim", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const fs = yield* FileSystem.FileSystem;
       const lockPath = yield* serverLockPath(stateDir);
 
-      // Snapshot the stale lock as starter A would. A live successor's claim
-      // looks identical on paper except for the pid, which liveness checks
-      // handle — the guard under test is that reclaim never unlinks a path
-      // whose content it has not re-confirmed as still dead.
+      // A live successor's claim looks identical on paper except for the pid,
+      // which the liveness check must recognize before reclaim can remove it.
       yield* fs.writeFileString(
         lockPath,
         `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
