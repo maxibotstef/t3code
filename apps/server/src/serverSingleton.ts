@@ -1,59 +1,39 @@
 /**
  * One server per data directory.
  *
- * Two T3 Code servers pointed at the same `--base-dir` both open `state.sqlite`
- * and both write `settings.json`, and they overwrite each other. The observed
- * incident: a desktop app auto-updated to a newer server while the old one was
- * still running, the new process found its port taken, silently bound a random
- * one, and ran blind against shared state. The visible symptom was a settings
- * toggle that would not stick — hours away from the actual cause.
+ * The server already relies on SQLite for cross-platform filesystem locking.
+ * A dedicated lock database holds one write transaction for the process
+ * lifetime: a crash releases the OS lock automatically, while another process
+ * receives SQLITE_BUSY before it can open T3's real persistence or bind HTTP.
  *
- * Nothing about that is detectable after the fact, so the fix is to refuse at
- * startup. A second server against a held directory exits with one clear
- * message instead of corrupting state.
+ * `server.lock` is display-only metadata for the refusal message. It never
+ * decides ownership; deleting it cannot release the SQLite lock.
  *
- * ## Why a pid file rather than `flock`
- *
- * An advisory `flock` is the better primitive: the kernel drops it when the
- * holder dies, so a crashed server leaves nothing stale to clean up. Node has no
- * binding for it, and adding a native dependency to the server for one lock is a
- * worse trade than handling staleness here.
- *
- * So the lock is an atomically created file holding the owner's identity, and
- * liveness is checked with signal 0. The tradeoff is honest: if a server is
- * killed and its pid is later reused by an unrelated process, this refuses to
- * start until the file is removed. That is the safe direction to fail, and the
- * message names the file for recovery after the reported pid is checked.
- *
- * ## Upgrading from a pre-lock version
- *
- * A pre-lock server writes no `server.lock`, so the file alone cannot see one.
- * It does persist `server-runtime.json` with its live pid though, so before
- * claiming the directory a live legacy runtime state is read as a held lock
- * and refused the same way. Otherwise the desktop auto-update incident this
- * exists to prevent still happens once on upgrade day — the new server starts
- * next to the old one against the same state.
+ * A pre-lock server has no lock database, so the first upgraded process also
+ * checks `server-runtime.json` and refuses while that recorded pid is live.
  */
 import * as Data from "effect/Data";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import { writeFileStringAtomically } from "./atomicWrite.ts";
 import { readPersistedServerRuntimeState } from "./serverRuntimeState.ts";
 
 export const SERVER_LOCK_FILENAME = "server.lock";
+export const SERVER_LOCK_DATABASE_FILENAME = "server-lock.sqlite";
 export const SERVER_RUNTIME_STATE_FILENAME = "server-runtime.json";
 
 export const ServerLockHolder = Schema.Struct({
   version: Schema.Literal(1),
+  ownerId: Schema.String,
   pid: Schema.Int,
   startedAt: Schema.String,
-  /** Absent until the server binds; the lock is taken before a port exists. */
+  /** Absent until the server binds; ownership is already held in SQLite. */
   port: Schema.optional(Schema.Int),
 });
 export type ServerLockHolder = typeof ServerLockHolder.Type;
@@ -67,29 +47,31 @@ export class ServerAlreadyRunningError extends Schema.TaggedErrorClass<ServerAlr
   {
     stateDir: Schema.String,
     lockPath: Schema.String,
-    holderPid: Schema.Int,
+    holderPid: Schema.optional(Schema.Int),
     holderPort: Schema.optional(Schema.Int),
-    holderStartedAt: Schema.String,
+    holderStartedAt: Schema.optional(Schema.String),
   },
 ) {
   override get message(): string {
-    const where =
-      this.holderPort === undefined
-        ? `pid ${this.holderPid}`
-        : `pid ${this.holderPid}, listening on port ${this.holderPort}`;
+    const holder =
+      this.holderPid === undefined
+        ? "another live T3 Code server"
+        : this.holderPort === undefined
+          ? `pid ${this.holderPid}`
+          : `pid ${this.holderPid}, listening on port ${this.holderPort}`;
     return [
       "Another T3 Code server is already using this data directory.",
       "",
       `  data directory: ${this.stateDir}`,
-      `  held by:        ${where}`,
-      `  since:          ${this.holderStartedAt}`,
+      `  held by:        ${holder}`,
+      ...(this.holderStartedAt === undefined ? [] : [`  since:          ${this.holderStartedAt}`]),
       "",
       "Two servers sharing one data directory overwrite each other's state.sqlite",
-      "and settings.json. Stop the running server, or start this one with a",
-      "different --base-dir.",
+      "and settings.json. Connect to the running server, stop it cleanly, or use",
+      "a different --base-dir.",
       "",
-      "Dead owners are reclaimed automatically on retry. If this message persists",
-      `after that pid is gone, confirm the pid was not reused before removing ${this.lockPath}.`,
+      `Ownership is released automatically when the process exits. ${this.lockPath}`,
+      "contains display metadata only; removing it does not release a live owner.",
     ].join("\n");
   }
 }
@@ -98,27 +80,15 @@ export class ServerLockUnavailableError extends Schema.TaggedErrorClass<ServerLo
   "ServerLockUnavailableError",
   {
     lockPath: Schema.String,
-    attempts: Schema.Int,
+    operation: Schema.String,
+    cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
-    return `Could not claim the server lock at ${this.lockPath} after ${this.attempts} attempts; another starting server kept reclaiming it.`;
+    return `Could not ${this.operation} the server ownership database at ${this.lockPath}.`;
   }
 }
 
-// How many reclaim-and-retry rounds against a confirmed-dead lock a starter
-// tolerates before concluding something else keeps recreating it: nothing a
-// real dead holder produces, everything a permission wall or a competing
-// starter produces.
-const MAX_RECLAIM_CYCLES = 3;
-
-/**
- * Whether a pid is a live process.
- *
- * `EPERM` means it exists and belongs to someone else, which still counts — a
- * server started under a different user is exactly the case that must not be
- * trampled.
- */
 export const processIsAliveWith = (pid: number, sendSignal: (pid: number) => void): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -132,6 +102,21 @@ export const processIsAliveWith = (pid: number, sendSignal: (pid: number) => voi
 export const processIsAlive = (pid: number): boolean =>
   processIsAliveWith(pid, (targetPid) => process.kill(targetPid, 0));
 
+interface LockDatabase {
+  readonly exec: (sql: string) => void;
+  readonly close: () => void;
+}
+
+interface HeldServerLock {
+  readonly database: LockDatabase;
+  readonly lockPath: string;
+  readonly ownerId: string;
+}
+
+class ServerLockAttemptError extends Data.TaggedError("ServerLockAttemptError")<{
+  readonly cause: unknown;
+}> {}
+
 const readHolder = Effect.fn("serverSingleton.readHolder")(function* (lockPath: string) {
   const fs = yield* FileSystem.FileSystem;
   const raw = yield* fs
@@ -144,16 +129,61 @@ const readHolder = Effect.fn("serverSingleton.readHolder")(function* (lockPath: 
   return Option.getOrUndefined(decodeHolder(raw));
 });
 
-const isAlreadyExists = (error: PlatformError.PlatformError): boolean =>
-  error.reason._tag === "AlreadyExists";
+const closeDatabase = (database: LockDatabase) =>
+  Effect.sync(() => {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // A failed BEGIN has no transaction to roll back.
+    }
+    database.close();
+  }).pipe(Effect.ignore);
 
-/**
- * A pre-lock server is live against this directory. Failure-phase marker rather
- * than an error: `serverRuntimeState.ts` already owns the file's decode-error
- * type, and the refusal shown to the user is the same `ServerAlreadyRunningError`
- * either way — `server.ts` converts this at the boundary where the config with
- * the path lives.
- */
+const openLockDatabase = Effect.fn("serverSingleton.openDatabase")(function* (lockPath: string) {
+  if (process.versions.bun !== undefined) {
+    const { Database } = yield* Effect.promise(() => import("bun:sqlite"));
+    return yield* Effect.try({
+      try: () => {
+        const database = new Database(lockPath, { create: true });
+        return {
+          exec: (sql: string) => database.exec(sql),
+          close: () => database.close(),
+        } satisfies LockDatabase;
+      },
+      catch: (cause) => new ServerLockUnavailableError({ lockPath, operation: "open", cause }),
+    });
+  }
+
+  const { DatabaseSync } = yield* Effect.promise(() => import("node:sqlite"));
+  return yield* Effect.try({
+    try: () => {
+      const database = new DatabaseSync(lockPath);
+      return {
+        exec: (sql: string) => database.exec(sql),
+        close: () => database.close(),
+      } satisfies LockDatabase;
+    },
+    catch: (cause) => new ServerLockUnavailableError({ lockPath, operation: "open", cause }),
+  });
+});
+
+export const isServerLockBusyError = (cause: unknown): boolean => {
+  const code =
+    cause instanceof Error && "code" in cause ? String((cause as NodeJS.ErrnoException).code) : "";
+  const errno =
+    cause instanceof Error && "errno" in cause
+      ? Number((cause as NodeJS.ErrnoException).errno)
+      : undefined;
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return (
+    code === "SQLITE_BUSY" ||
+    code === "SQLITE_BUSY_SNAPSHOT" ||
+    errno === 5 ||
+    /database is (?:locked|busy)/i.test(message)
+  );
+};
+
+/** A pre-lock server is live against this directory. */
 export class LiveLegacyServerRuntime extends Data.TaggedError("LiveLegacyServerRuntime")<{
   readonly state: {
     readonly pid: number;
@@ -162,106 +192,100 @@ export class LiveLegacyServerRuntime extends Data.TaggedError("LiveLegacyServerR
   };
 }> {}
 
-/**
- * Claims the directory, or explains who holds it.
- *
- * A lock file whose owner is gone is reclaimed rather than treated as a
- * permanent block: a dead holder must not lock its own directory forever.
- * Reclaiming re-races the exclusive create, so two servers starting together
- * still produce exactly one winner.
- */
-const claimLock = Effect.fn("serverSingleton.claimLock")(function* (input: {
-  readonly stateDir: string;
-  readonly lockPath: string;
-  readonly legacyRuntimeStatePath: string;
-  readonly startedAt: string;
-}) {
+const beginExclusiveWrite = Effect.fn("serverSingleton.beginExclusiveWrite")(function* (
+  database: LockDatabase,
+  lockPath: string,
+) {
+  const result = yield* Effect.try({
+    try: () => {
+      database.exec("PRAGMA busy_timeout = 0");
+      database.exec("BEGIN IMMEDIATE");
+    },
+    catch: (cause) => new ServerLockAttemptError({ cause }),
+  }).pipe(
+    Effect.as({ ok: true as const }),
+    Effect.catch((error) => Effect.succeed({ ok: false as const, cause: error.cause })),
+  );
+  if (result.ok) return true;
+  if (isServerLockBusyError(result.cause)) return false;
+  return yield* new ServerLockUnavailableError({
+    lockPath,
+    operation: "lock",
+    cause: result.cause,
+  });
+});
+
+export const serverLockPath = Effect.fn("serverSingleton.lockPath")(function* (stateDir: string) {
+  const path = yield* Path.Path;
+  return path.join(stateDir, SERVER_LOCK_FILENAME);
+});
+
+export const serverLockDatabasePath = Effect.fn("serverSingleton.databasePath")(function* (
+  stateDir: string,
+) {
+  const path = yield* Path.Path;
+  return path.join(stateDir, SERVER_LOCK_DATABASE_FILENAME);
+});
+
+export const legacyServerRuntimeStatePath = Effect.fn("serverSingleton.legacyStatePath")(function* (
+  stateDir: string,
+) {
+  const path = yield* Path.Path;
+  return path.join(stateDir, SERVER_RUNTIME_STATE_FILENAME);
+});
+
+const acquireLock = Effect.fn("serverSingleton.acquireLock")(function* (stateDir: string) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const payload = encodeHolder({ version: 1, pid: process.pid, startedAt: input.startedAt });
+  const crypto = yield* Crypto.Crypto;
+  const lockPath = yield* serverLockPath(stateDir);
+  const databasePath = yield* serverLockDatabasePath(stateDir);
+  const legacyRuntimeStatePath = yield* legacyServerRuntimeStatePath(stateDir);
 
-  // A pre-lock server writes no lock, so the file alone is blind to one — but
-  // it does persist its live pid in `server-runtime.json`. Refuse a live
-  // legacy runtime exactly like a live lock holder, before the lock is ever
-  // created; otherwise the upgrade that introduces this guard still starts
-  // next to the very server it is meant to replace. A dead legacy pid is
-  // ignored here: reclaim of its leftover lock is what removes the file.
-  const legacyState = yield* readPersistedServerRuntimeState(input.legacyRuntimeStatePath);
+  const legacyState = yield* readPersistedServerRuntimeState(legacyRuntimeStatePath);
   if (Option.isSome(legacyState) && processIsAlive(legacyState.value.pid)) {
     return yield* new LiveLegacyServerRuntime({ state: legacyState.value });
   }
 
-  yield* fs.makeDirectory(path.dirname(input.lockPath), { recursive: true });
-
-  let reclaimCycles = 0;
-  while (true) {
-    // Let a competing starter or a just-created lock finish its write before
-    // inspecting the current owner.
-    yield* Effect.yieldNow;
-    const created = yield* fs.writeFileString(input.lockPath, payload, { flag: "wx" }).pipe(
-      Effect.as(true),
-      Effect.catch((error) =>
-        isAlreadyExists(error) ? Effect.succeed(false) : Effect.fail(error),
-      ),
-    );
-    if (created) return undefined;
-
-    const holder = yield* readHolder(input.lockPath);
-    if (holder !== undefined && processIsAlive(holder.pid)) {
-      return new ServerAlreadyRunningError({
-        stateDir: input.stateDir,
-        lockPath: input.lockPath,
-        holderPid: holder.pid,
-        ...(holder.port === undefined ? {} : { holderPort: holder.port }),
-        holderStartedAt: holder.startedAt,
+  yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+  const database = yield* openLockDatabase(databasePath);
+  return yield* Effect.gen(function* () {
+    if (!(yield* beginExclusiveWrite(database, databasePath))) {
+      const holder = yield* readHolder(lockPath);
+      return yield* new ServerAlreadyRunningError({
+        stateDir,
+        lockPath,
+        ...(holder === undefined
+          ? {}
+          : {
+              holderPid: holder.pid,
+              holderStartedAt: holder.startedAt,
+              ...(holder.port === undefined ? {} : { holderPort: holder.port }),
+            }),
       });
     }
 
-    // Re-read after yielding before removal. A live writer that was still
-    // finishing its exclusive-create payload, or another starter that won a
-    // preceding reclaim, is then observed and preserved.
-    yield* Effect.yieldNow;
-    const confirmedHolder = yield* readHolder(input.lockPath);
-    if (confirmedHolder !== undefined && processIsAlive(confirmedHolder.pid)) {
-      continue;
-    }
-
-    yield* fs.remove(input.lockPath, { force: true });
-    reclaimCycles += 1;
-    if (reclaimCycles >= MAX_RECLAIM_CYCLES) {
-      return new ServerLockUnavailableError({
-        lockPath: input.lockPath,
-        attempts: reclaimCycles,
-      });
-    }
-  }
+    const ownerId = yield* crypto.randomUUIDv4;
+    const startedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* writeFileStringAtomically({
+      filePath: lockPath,
+      contents: encodeHolder({ version: 1, ownerId, pid: process.pid, startedAt }),
+    });
+    return { database, lockPath, ownerId } satisfies HeldServerLock;
+  }).pipe(Effect.onError(() => closeDatabase(database)));
 });
 
-/**
- * Releases only a lock this process verifiably owns, so a successor is never
- * evicted. An undecodable file is left alone: it is either a live re-entrant
- * claim (the winning starter's just-created file, or another process's) or a
- * crash fragment, and crash fragments are what reclaim exists for.
- */
-export const releaseServerLock = Effect.fn("serverSingleton.release")(function* (lockPath: string) {
+const releaseLock = Effect.fn("serverSingleton.releaseLock")(function* (held: HeldServerLock) {
   const fs = yield* FileSystem.FileSystem;
-  const holder = yield* readHolder(lockPath);
-  if (holder === undefined || holder.pid !== process.pid) return;
-  yield* fs.remove(lockPath, { force: true }).pipe(Effect.ignore);
+  const holder = yield* readHolder(held.lockPath).pipe(Effect.orElseSucceed(() => undefined));
+  if (holder?.ownerId === held.ownerId) {
+    // Remove metadata while the SQLite transaction still excludes successors.
+    yield* fs.remove(held.lockPath, { force: true }).pipe(Effect.ignore);
+  }
+  yield* closeDatabase(held.database);
 });
 
-/**
- * Records the bound port on the lock we already hold.
- *
- * The rewrite goes through write-temp-then-rename so a reader never observes
- * an empty or partial file: with an in-place rewrite, a concurrent starter
- * could mistake the truncated file for a crashed owner and reclaim a live
- * lock — the exact concurrent-servers corruption the lock exists to prevent.
- *
- * Only for the error message a *later* server prints: knowing the holder's port
- * turns "something else is running" into an address the user can open. Failure
- * is ignored — the lock's job is done once it is held.
- */
+/** Records the bound port in display metadata while SQLite owns the lock. */
 export const recordServerLockPort = Effect.fn("serverSingleton.recordPort")(function* (
   lockPath: string,
   port: number,
@@ -274,58 +298,26 @@ export const recordServerLockPort = Effect.fn("serverSingleton.recordPort")(func
   }).pipe(Effect.ignore);
 });
 
-export const serverLockPath = Effect.fn("serverSingleton.lockPath")(function* (stateDir: string) {
-  const path = yield* Path.Path;
-  return path.join(stateDir, SERVER_LOCK_FILENAME);
-});
-
-export const legacyServerRuntimeStatePath = Effect.fn("serverSingleton.legacyStatePath")(function* (
-  stateDir: string,
-) {
-  const path = yield* Path.Path;
-  return path.join(stateDir, SERVER_RUNTIME_STATE_FILENAME);
-});
-
-/**
- * Holds the data directory for the lifetime of the returned scope.
- *
- * Acquired before anything opens the database or binds a port, and released on
- * shutdown. A live pre-lock server reads as a held lock here too: callers see
- * one refusal type regardless of which generation holds the directory.
- */
+/** Holds the state directory until the caller's scope closes. */
 export const acquireServerSingleton = Effect.fn("serverSingleton.acquire")(function* (
   stateDir: string,
 ) {
-  const lockPath = yield* serverLockPath(stateDir);
   const legacyRuntimeStatePath = yield* legacyServerRuntimeStatePath(stateDir);
-  const startedAt = DateTime.formatIso(yield* DateTime.now);
   return yield* Effect.acquireRelease(
-    Effect.gen(function* () {
-      const failure = yield* claimLock({
-        stateDir,
-        lockPath,
-        legacyRuntimeStatePath,
-        startedAt,
-      }).pipe(
-        // The message names `server-runtime.json` (not `server.lock`) as the
-        // file to remove if the process is gone — that is all a pre-lock
-        // server ever wrote.
-        Effect.catchTags({
-          LiveLegacyServerRuntime: (legacy) =>
-            Effect.fail(
-              new ServerAlreadyRunningError({
-                stateDir,
-                lockPath: legacyRuntimeStatePath,
-                holderPid: legacy.state.pid,
-                holderPort: legacy.state.port,
-                holderStartedAt: legacy.state.startedAt,
-              }),
-            ),
-        }),
-      );
-      if (failure !== undefined) return yield* failure;
-      return lockPath;
-    }),
-    () => releaseServerLock(lockPath).pipe(Effect.ignore),
-  );
+    acquireLock(stateDir).pipe(
+      Effect.catchTags({
+        LiveLegacyServerRuntime: (legacy) =>
+          Effect.fail(
+            new ServerAlreadyRunningError({
+              stateDir,
+              lockPath: legacyRuntimeStatePath,
+              holderPid: legacy.state.pid,
+              holderPort: legacy.state.port,
+              holderStartedAt: legacy.state.startedAt,
+            }),
+          ),
+      }),
+    ),
+    releaseLock,
+  ).pipe(Effect.map((held) => held.lockPath));
 });

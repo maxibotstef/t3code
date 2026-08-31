@@ -11,12 +11,14 @@ import { makeServerLayer } from "./server.ts";
 import { PersistedServerRuntimeState } from "./serverRuntimeState.ts";
 import {
   SERVER_LOCK_FILENAME,
+  SERVER_LOCK_DATABASE_FILENAME,
   SERVER_RUNTIME_STATE_FILENAME,
   acquireServerSingleton,
+  isServerLockBusyError,
   processIsAlive,
   processIsAliveWith,
   recordServerLockPort,
-  releaseServerLock,
+  serverLockDatabasePath,
   serverLockPath,
 } from "./serverSingleton.ts";
 
@@ -29,7 +31,7 @@ const makeStateDir = Effect.fn("test.makeStateDir")(function* () {
 
 /** A stale lock file, written without the module's own encoder on purpose. */
 const staleHolder = (pid: number) =>
-  `{"version":1,"pid":${pid},"startedAt":"2026-01-01T00:00:00.000Z"}`;
+  `{"version":1,"ownerId":"stale-owner","pid":${pid},"startedAt":"2026-01-01T00:00:00.000Z"}`;
 
 const PersistedServerRuntimeStateFromJson = Schema.fromJsonString(PersistedServerRuntimeState);
 const encodeRuntimeState = Schema.encodeSync(PersistedServerRuntimeStateFromJson);
@@ -52,17 +54,17 @@ layer("serverSingleton", (it) => {
       const baseDir = yield* fs.makeTempDirectory({ prefix: "t3-singleton-server-layer-" });
       const stateDir = path.join(baseDir, "userdata");
       yield* fs.makeDirectory(stateDir, { recursive: true });
-      yield* fs.writeFileString(
-        path.join(stateDir, SERVER_LOCK_FILENAME),
-        `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* acquireServerSingleton(stateDir);
+          const failure = yield* Layer.build(
+            makeServerLayer.pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), baseDir))),
+          ).pipe(Effect.scoped, Effect.flip);
+
+          assert.strictEqual(failure._tag, "ServerAlreadyRunningError");
+          assert.isFalse(yield* fs.exists(path.join(stateDir, "state.sqlite")));
+        }),
       );
-
-      const failure = yield* Layer.build(
-        makeServerLayer.pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), baseDir))),
-      ).pipe(Effect.scoped, Effect.flip);
-
-      assert.strictEqual(failure._tag, "ServerAlreadyRunningError");
-      assert.isFalse(yield* fs.exists(path.join(stateDir, "state.sqlite")));
     }),
   );
 
@@ -103,7 +105,7 @@ layer("serverSingleton", (it) => {
     }),
   );
 
-  it.effect("reclaims a lock whose owner is gone", () =>
+  it.effect("overwrites stale display metadata after its owner is gone", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const fs = yield* FileSystem.FileSystem;
@@ -112,18 +114,18 @@ layer("serverSingleton", (it) => {
       // be live. A crashed server must not lock its own directory forever.
       yield* fs.writeFileString(lockPath, staleHolder(4194304));
 
-      // One call confirms the dead holder, reclaims it, and claims the freed
-      // directory on the same pass.
       yield* Effect.scoped(
         Effect.gen(function* () {
           const held = yield* acquireServerSingleton(stateDir);
           assert.strictEqual(held, lockPath);
+          const metadata = yield* fs.readFileString(lockPath);
+          assert.notInclude(metadata, "stale-owner");
         }),
       );
     }),
   );
 
-  it.effect("reclaims a lock file left half-written by a crash", () =>
+  it.effect("overwrites half-written display metadata after a crash", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const fs = yield* FileSystem.FileSystem;
@@ -138,16 +140,20 @@ layer("serverSingleton", (it) => {
     }),
   );
 
-  it.effect("does not release a lock another process has reclaimed", () =>
+  it.effect("does not remove display metadata replaced by another owner", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const fs = yield* FileSystem.FileSystem;
       const lockPath = yield* serverLockPath(stateDir);
-      yield* fs.writeFileString(lockPath, staleHolder(4194304));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* acquireServerSingleton(stateDir);
+          yield* fs.writeFileString(lockPath, staleHolder(process.pid));
+        }),
+      );
 
-      yield* releaseServerLock(lockPath);
-      // Evicting a live successor would recreate the very bug this prevents.
       assert.isTrue(yield* fs.exists(lockPath));
+      assert.include(yield* fs.readFileString(lockPath), "stale-owner");
     }),
   );
 
@@ -183,12 +189,14 @@ layer("serverSingleton", (it) => {
     }),
   );
 
-  it.effect("uses a lock file inside the state directory", () =>
+  it.effect("keeps ownership and display metadata inside the state directory", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const path = yield* Path.Path;
       const lockPath = yield* serverLockPath(stateDir);
+      const databasePath = yield* serverLockDatabasePath(stateDir);
       assert.strictEqual(lockPath, path.join(stateDir, SERVER_LOCK_FILENAME));
+      assert.strictEqual(databasePath, path.join(stateDir, SERVER_LOCK_DATABASE_FILENAME));
     }),
   );
 
@@ -207,6 +215,16 @@ layer("serverSingleton", (it) => {
         throw Object.assign(new Error("not found"), { code: "ESRCH" });
       }),
     );
+  });
+
+  it("recognizes Node and Bun SQLite busy errors", () => {
+    assert.isTrue(
+      isServerLockBusyError(
+        Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }),
+      ),
+    );
+    assert.isTrue(isServerLockBusyError(Object.assign(new Error("busy"), { errno: 5 })));
+    assert.isFalse(isServerLockBusyError(new Error("disk I/O error")));
   });
 
   it.effect("refuses next to a live pre-lock server that wrote no lock", () =>
@@ -272,60 +290,7 @@ layer("serverSingleton", (it) => {
     }),
   );
 
-  it.effect("a starter cannot reclaim a lock a live holder still owns", () =>
-    Effect.gen(function* () {
-      const stateDir = yield* makeStateDir();
-      const fs = yield* FileSystem.FileSystem;
-      const lockPath = yield* serverLockPath(stateDir);
-
-      // Starter B holds the directory live. Starter A must refuse rather than
-      // remove B's claim.
-      yield* fs.writeFileString(
-        lockPath,
-        `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
-      );
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          // Undecodable-by-design: B's pid is live, so A must refuse. Before
-          // the fix, A's unconditional reclaim deleted B's lock and A owned
-          // the directory alongside B.
-          const failure = yield* acquireServerSingleton(stateDir).pipe(Effect.flip);
-          assert.strictEqual(failure._tag, "ServerAlreadyRunningError");
-        }),
-      );
-
-      // And the lock is still on disk, owned by B, not reclaimed under it.
-      assert.isTrue(yield* fs.exists(lockPath));
-      const holder = yield* fs.readFileString(lockPath);
-      assert.include(holder, `"pid":${process.pid}`);
-    }),
-  );
-
-  it.effect("does not unlink a live holder encountered during reclaim", () =>
-    Effect.gen(function* () {
-      const stateDir = yield* makeStateDir();
-      const fs = yield* FileSystem.FileSystem;
-      const lockPath = yield* serverLockPath(stateDir);
-
-      // A live successor's claim looks identical on paper except for the pid,
-      // which the liveness check must recognize before reclaim can remove it.
-      yield* fs.writeFileString(
-        lockPath,
-        `{"version":1,"pid":${process.pid},"startedAt":"2026-01-01T00:00:00.000Z"}`,
-      );
-
-      const failure = yield* acquireServerSingleton(stateDir).pipe(Effect.flip);
-
-      // Under the old unconditional `fs.remove(lockPath)`, claim would
-      // *succeed* here by deleting this live claim first.
-      assert.strictEqual(failure._tag, "ServerAlreadyRunningError");
-      assert.isTrue(yield* fs.exists(lockPath));
-      const holder = yield* fs.readFileString(lockPath);
-      assert.include(holder, `"pid":${process.pid}`);
-    }),
-  );
-
-  it.effect("a partial metadata update is never readable as an empty owner", () =>
+  it.effect("updates port metadata atomically", () =>
     Effect.gen(function* () {
       const stateDir = yield* makeStateDir();
       const fs = yield* FileSystem.FileSystem;
@@ -333,13 +298,6 @@ layer("serverSingleton", (it) => {
       yield* Effect.scoped(
         Effect.gen(function* () {
           yield* acquireServerSingleton(stateDir);
-          // Before: the in-place rewrite truncated the file first, so a reader
-          // mid-update decoded an empty holder and could reclaim a live lock.
-          // The atomic write means the bytes on disk are always a full holder —
-          // and a temp-file rename is what arranges that: it stages the payload
-          // in a `.server.lock.*` sibling and swaps it in, which an in-place
-          // truncate never does. Asserting the update *completed* then lets a
-          // concurrent reader never observe an empty or partial lock.
           yield* recordServerLockPort(lockPath, 3775);
 
           const failure = yield* acquireServerSingleton(stateDir).pipe(Effect.flip);
@@ -350,10 +308,7 @@ layer("serverSingleton", (it) => {
         }),
       );
 
-      // No temp staging directory outlives the update: the payload arrives at
-      // the lock path whole or not at all, which is what makes "partial" reads
-      // above unreachable rather than merely unlucky. The scope above released
-      // the lock itself — only the temp-directory shape is under test.
+      // No temp staging directory outlives the metadata update.
       const leftovers = yield* fs
         .readDirectory(stateDir)
         .pipe(
