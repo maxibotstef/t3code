@@ -190,9 +190,11 @@ const RelayClientLive = Layer.unwrap(
 /**
  * Claims the data directory before anything binds a port or opens the database.
  *
- * Provided into `HttpServerLive` rather than merged alongside it so the ordering
- * is structural: the lock is a dependency of the thing it protects, and a second
- * server cannot reach a listening socket while another holds the directory.
+ * Provided into both the runtime services and `HttpServerLive` rather than merged
+ * alongside them so the ordering is structural: the lock is a dependency of the
+ * things it protects, and a second server cannot open persistence/provider state
+ * or reach a listening socket while another holds the directory. Effect memoizes
+ * this shared layer within the server graph, so both branches use one held claim.
  */
 const ServerSingletonLive = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -696,7 +698,11 @@ export const makeServerLayer = Layer.unwrap(
         ],
         { concurrency: "unbounded" },
       ).pipe(Effect.asVoid),
-    }).pipe(Layer.provideMerge(RuntimeDependenciesLive), Layer.provide(launcherLayer));
+    }).pipe(
+      Layer.provideMerge(RuntimeDependenciesLive),
+      Layer.provide(launcherLayer),
+      Layer.provide(ServerSingletonLive),
+    );
 
     const routesLayer = HttpRouter.serve(makeRoutesLayer.pipe(Layer.provide(launcherLayer)), {
       disableLogger: !config.logWebSocketEvents,
