@@ -11,6 +11,9 @@
  *
  * A pre-lock server has no lock database, so the first upgraded process also
  * checks `server-runtime.json` and refuses while that recorded pid is live.
+ * That compatibility check starts only after the old binary publishes its
+ * runtime state; an unmodified old binary cannot participate in a lock that
+ * did not exist when it shipped.
  */
 import * as Data from "effect/Data";
 import * as Crypto from "effect/Crypto";
@@ -50,6 +53,7 @@ export class ServerAlreadyRunningError extends Schema.TaggedErrorClass<ServerAlr
     holderPid: Schema.optional(Schema.Int),
     holderPort: Schema.optional(Schema.Int),
     holderStartedAt: Schema.optional(Schema.String),
+    legacyRuntimeStatePath: Schema.optional(Schema.String),
   },
 ) {
   override get message(): string {
@@ -59,7 +63,7 @@ export class ServerAlreadyRunningError extends Schema.TaggedErrorClass<ServerAlr
         : this.holderPort === undefined
           ? `pid ${this.holderPid}`
           : `pid ${this.holderPid}, listening on port ${this.holderPort}`;
-    return [
+    const common = [
       "Another T3 Code server is already using this data directory.",
       "",
       `  data directory: ${this.stateDir}`,
@@ -69,6 +73,17 @@ export class ServerAlreadyRunningError extends Schema.TaggedErrorClass<ServerAlr
       "Two servers sharing one data directory overwrite each other's state.sqlite",
       "and settings.json. Connect to the running server, stop it cleanly, or use",
       "a different --base-dir.",
+    ];
+    if (this.legacyRuntimeStatePath !== undefined) {
+      return [
+        ...common,
+        "",
+        `${this.legacyRuntimeStatePath} is the compatibility guard for this older`,
+        "server. Do not remove it while the recorded process is live.",
+      ].join("\n");
+    }
+    return [
+      ...common,
       "",
       `Ownership is released automatically when the process exits. ${this.lockPath}`,
       "contains display metadata only; removing it does not release a live owner.",
@@ -314,6 +329,7 @@ export const acquireServerSingleton = Effect.fn("serverSingleton.acquire")(funct
               holderPid: legacy.state.pid,
               holderPort: legacy.state.port,
               holderStartedAt: legacy.state.startedAt,
+              legacyRuntimeStatePath,
             }),
           ),
       }),

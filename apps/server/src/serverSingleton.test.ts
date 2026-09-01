@@ -245,6 +245,9 @@ layer("serverSingleton", (it) => {
         assert.strictEqual(failure.holderPid, process.pid);
         assert.strictEqual(failure.holderPort, 3775);
         assert.include(failure.message, SERVER_RUNTIME_STATE_FILENAME);
+        assert.include(failure.message, "compatibility guard for this older");
+        assert.include(failure.message, "Do not remove it while the recorded process is live");
+        assert.notInclude(failure.message, "contains display metadata only");
       }
       // And it must not have claimed the directory it refused.
       assert.isFalse(yield* fs.exists(yield* serverLockPath(stateDir)));
