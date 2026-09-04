@@ -3932,6 +3932,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     targetBranch: string,
     materialization?: VcsWorktreeMaterializationState,
   ) {
+    // `git worktree add` leaves submodules empty. Populate them best-effort;
+    // an unreachable first-time submodule must not roll back the thread.
     const hasSubmodules = yield* fileSystem
       .exists(path.join(worktreePath, ".gitmodules"))
       .pipe(Effect.orElseSucceed(() => false));
@@ -4298,10 +4300,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }
         if (missingRead.value.length > 0) {
           const failedState: VcsWorktreeMaterializationState = {
-            ...requestedMaterialization,
+            ...fullMaterialization,
             status: "failed",
-            effectiveProfileId: "full",
-            mode: "full",
             reason: `${fallbackReason}:full-fallback-required-paths-missing`,
           };
           yield* writeMaterializationState(worktreePath, failedState);
