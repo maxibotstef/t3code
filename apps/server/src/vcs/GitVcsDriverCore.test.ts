@@ -1656,6 +1656,90 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("respects simple auto-setup when the local and remote branch names differ", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-simple-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["push", "origin", initialBranch]);
+        yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "simple"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "simple-auto-setup",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/simple-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-SIMPLE",
+            taskSlug: "simple-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        const upstream = yield* driver.execute({
+          operation: "test.simpleAutoSetup",
+          args: ["rev-parse", "--abbrev-ref", "@{upstream}"],
+          cwd: worktreePath,
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(upstream.exitCode, 0);
+      }),
+    );
+
+    it.effect("inherits the start branch upstream when auto-setup is inherit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-inherit-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["push", "-u", "origin", initialBranch]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "inherit"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "inherit-auto-setup",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/inherit-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-INHERIT",
+            taskSlug: "inherit-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          `origin/${initialBranch}`,
+        );
+      }),
+    );
+
     it.effect("keeps default worktree placement named after a project subdirectory", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

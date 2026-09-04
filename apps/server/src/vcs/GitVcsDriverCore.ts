@@ -1218,7 +1218,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       cwd: repoRoot,
       args: ["cat-file", "blob", `${pinnedCommit}:${relativePath}`],
     } as const;
-    return yield* Effect.gen(function* () {
+    const timed = yield* Effect.gen(function* () {
       const child = yield* commandSpawner
         .spawn(ChildProcess.make("git", commandInput.args, { cwd: repoRoot }))
         .pipe(
@@ -1231,16 +1231,33 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             ),
           ),
         );
-      const [chunks, , exitCode] = yield* Effect.all(
+      const chunks: Array<Uint8Array> = [];
+      let byteLength = 0;
+      const [, , exitCode] = yield* Effect.all(
         [
-          Stream.runCollect(child.stdout).pipe(
+          Stream.runForEach(child.stdout, (chunk) => {
+            byteLength += chunk.byteLength;
+            if (byteLength > DEFAULT_MAX_OUTPUT_BYTES) {
+              return Effect.fail(
+                materializationError(
+                  operation,
+                  repoRoot,
+                  "Committed blob exceeded the materialization byte limit.",
+                ),
+              );
+            }
+            chunks.push(chunk);
+            return Effect.void;
+          }).pipe(
             Effect.mapError((cause) =>
-              materializationError(
-                operation,
-                repoRoot,
-                "Failed to collect committed blob bytes.",
-                cause,
-              ),
+              Schema.is(GitCommandError)(cause)
+                ? cause
+                : materializationError(
+                    operation,
+                    repoRoot,
+                    "Failed to collect committed blob bytes.",
+                    cause,
+                  ),
             ),
           ),
           collectOutput(commandInput, child.stderr, DEFAULT_MAX_OUTPUT_BYTES, false, undefined),
@@ -1258,17 +1275,22 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         { concurrency: "unbounded" },
       );
       if (exitCode !== 0) return null;
-      const arrays = Array.from(chunks);
-      const byteLength = arrays.reduce((total, chunk) => total + chunk.byteLength, 0);
-      if (byteLength > DEFAULT_MAX_OUTPUT_BYTES) return null;
       const bytes = new Uint8Array(byteLength);
       let offset = 0;
-      for (const chunk of arrays) {
+      for (const chunk of chunks) {
         bytes.set(chunk, offset);
         offset += chunk.byteLength;
       }
       return bytes;
-    }).pipe(Effect.scoped);
+    }).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.scoped);
+    if (Option.isNone(timed)) {
+      return yield* materializationError(
+        operation,
+        repoRoot,
+        "Timed out while reading committed blob bytes.",
+      );
+    }
+    return timed.value;
   });
 
   const readMaterializationContract = Effect.fn("readMaterializationContract")(function* (
@@ -4014,12 +4036,42 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ["config", "--get", "branch.autoSetupMerge"],
         { allowNonZeroExit: true },
       );
-      if (trackingRef && autoSetupMerge.stdout.trim() !== "false") {
+      const autoSetupMode = autoSetupMerge.stdout.trim() || "true";
+      let upstreamToSet: string | null = null;
+      if (autoSetupMode === "inherit") {
+        const inheritedUpstream = yield* executeGit(
+          "GitVcsDriver.createWorktree.inheritedUpstream",
+          repoRoot,
+          ["rev-parse", "--abbrev-ref", `${input.refName}@{upstream}`],
+          { allowNonZeroExit: true },
+        );
+        if (inheritedUpstream.exitCode === 0) upstreamToSet = inheritedUpstream.stdout.trim();
+      } else if (trackingRef && autoSetupMode !== "false") {
+        if (autoSetupMode === "simple") {
+          const remoteNames = yield* listRemoteNames(repoRoot).pipe(Effect.orElseSucceed(() => []));
+          const remote = parseRemoteRefWithRemoteNames(
+            trackingRef,
+            remoteNames.toSorted((left, right) => right.length - left.length),
+          );
+          if (remote?.branchName === input.newRefName) upstreamToSet = trackingRef;
+        } else {
+          upstreamToSet = trackingRef;
+        }
+      } else if (autoSetupMode === "always") {
+        const localStart = yield* executeGit(
+          "GitVcsDriver.createWorktree.localTrackingStart",
+          repoRoot,
+          ["show-ref", "--verify", "--quiet", `refs/heads/${input.refName}`],
+          { allowNonZeroExit: true },
+        );
+        if (localStart.exitCode === 0) upstreamToSet = input.refName;
+      }
+      if (upstreamToSet) {
         const preserved = yield* Effect.exit(
           runGit("GitVcsDriver.createWorktree.preserveUpstream", repoRoot, [
             "branch",
             "--set-upstream-to",
-            trackingRef,
+            upstreamToSet,
             input.newRefName,
           ]),
         );
@@ -4075,11 +4127,14 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           if (Exit.isFailure(taskCard)) {
             fallbackReason = "task-card-materialization-failed";
           } else {
-            const missing = yield* requiredMaterializationPathsMissing(
-              worktreePath,
-              requestedMaterialization.requiredPaths,
+            const missingRead = yield* Effect.exit(
+              requiredMaterializationPathsMissing(
+                worktreePath,
+                requestedMaterialization.requiredPaths,
+              ),
             );
-            if (missing.length > 0) fallbackReason = "required-paths-missing";
+            if (Exit.isFailure(missingRead)) fallbackReason = "required-path-inspection-failed";
+            else if (missingRead.value.length > 0) fallbackReason = "required-paths-missing";
           }
         }
       }
@@ -4157,11 +4212,23 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             };
           }
         }
-        const missing = yield* requiredMaterializationPathsMissing(
-          worktreePath,
-          fullMaterialization.requiredPaths,
+        const missingRead = yield* Effect.exit(
+          requiredMaterializationPathsMissing(worktreePath, fullMaterialization.requiredPaths),
         );
-        if (missing.length > 0) {
+        if (Exit.isFailure(missingRead)) {
+          const failedState: VcsWorktreeMaterializationState = {
+            ...fullMaterialization,
+            status: "failed",
+            reason: `${fallbackReason}:full-fallback-required-paths-unreadable`,
+          };
+          yield* writeMaterializationState(worktreePath, failedState);
+          return yield* materializationError(
+            "GitVcsDriver.createWorktree",
+            worktreePath,
+            `${fallbackReason}; full fallback required paths could not be inspected. The never-released worktree was preserved for diagnosis.`,
+          );
+        }
+        if (missingRead.value.length > 0) {
           const failedState: VcsWorktreeMaterializationState = {
             ...requestedMaterialization,
             status: "failed",
@@ -4173,7 +4240,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           return yield* materializationError(
             "GitVcsDriver.createWorktree",
             worktreePath,
-            `${fallbackReason}; full fallback is missing required path(s): ${missing.join(", ")}. The never-released worktree was preserved for diagnosis.`,
+            `${fallbackReason}; full fallback is missing required path(s): ${missingRead.value.join(", ")}. The never-released worktree was preserved for diagnosis.`,
           );
         }
         materialization = fullMaterialization;
@@ -4273,11 +4340,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       );
     }
     if (input.newRefName) {
-      const observedBranch = (yield* runGitStdout(
-        "GitVcsDriver.createWorktree.verifyBranch",
-        worktreePath,
-        ["branch", "--show-current"],
-      )).trim();
+      const observedBranchRead = yield* Effect.exit(
+        runGitStdout("GitVcsDriver.createWorktree.verifyBranch", worktreePath, [
+          "branch",
+          "--show-current",
+        ]),
+      );
+      if (Exit.isFailure(observedBranchRead)) {
+        yield* writeMaterializationState(worktreePath, {
+          ...materialization,
+          status: "failed",
+          reason: "materialized-branch-unreadable",
+        });
+        return yield* materializationError(
+          "GitVcsDriver.createWorktree",
+          worktreePath,
+          "Materialized worktree branch could not be read. The never-released worktree was preserved for diagnosis.",
+        );
+      }
+      const observedBranch = observedBranchRead.value.trim();
       if (observedBranch !== input.newRefName) {
         yield* writeMaterializationState(worktreePath, {
           ...materialization,
