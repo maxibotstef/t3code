@@ -1578,6 +1578,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* git(cwd, ["remote", "add", "origin", remote]);
         yield* git(cwd, ["push", "origin", initialBranch]);
         yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "true"]);
         const pathService = yield* Path.Path;
         const worktreePath = pathService.join(
           yield* makeTmpDir("git-worktrees-"),
@@ -1626,6 +1627,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* git(cwd, ["checkout", initialBranch]);
         yield* git(cwd, ["branch", "-D", "remote-only"]);
         yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "true"]);
         const pathService = yield* Path.Path;
         const worktreePath = pathService.join(
           yield* makeTmpDir("git-worktrees-"),
@@ -1710,6 +1712,9 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         );
 
         assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.operation, "GitVcsDriver.createWorktree.pinCommit");
+        }
         assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
     );
@@ -1880,7 +1885,6 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
-        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
         const pathService = yield* Path.Path;
         const projectCwd = pathService.join(cwd, "nested-project");
         const fileSystem = yield* FileSystem.FileSystem;
@@ -2538,14 +2542,18 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* fileSystem.writeFileString(emptyGlobalConfig, "");
         const previousXdg = process.env.XDG_CONFIG_HOME;
         const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+        const previousNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
         process.env.XDG_CONFIG_HOME = xdgRoot;
         process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
+        process.env.GIT_CONFIG_NOSYSTEM = "1";
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
             if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
             else process.env.XDG_CONFIG_HOME = previousXdg;
             if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
             else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+            if (previousNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+            else process.env.GIT_CONFIG_NOSYSTEM = previousNoSystem;
           }),
         );
         const worktreePath = pathService.join(
@@ -2654,6 +2662,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           yield* writeMaterializationFixture(cwd);
         yield* git(cwd, ["config", "core.autocrlf", "true"]);
         const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
         const worktreePath = pathService.join(
           yield* makeTmpDir("git-worktrees-"),
           "autocrlf-materialization",
@@ -2678,6 +2687,16 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
 
         assert.equal(created.materialization?.effectiveProfileId, "governance-review");
         assert.equal(created.materialization?.taskCardSha256, expectedTaskCardSha256);
+        assert.notEqual(
+          NodeCrypto.createHash("sha256")
+            .update(
+              yield* fileSystem.readFile(
+                pathService.join(worktreePath, "ops/stef-task/task/stef-task.json"),
+              ),
+            )
+            .digest("hex"),
+          expectedTaskCardSha256,
+        );
         assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "sparse");
         const expanded = yield* driver.expandWorktreeMaterializationFull(
           worktreePath,
