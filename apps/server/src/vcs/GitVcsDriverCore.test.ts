@@ -1697,6 +1697,34 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           allowNonZeroExit: true,
         });
         assert.notEqual(upstream.exitCode, 0);
+
+        yield* git(cwd, ["config", "branch.autoSetupMerge", ""]);
+        const emptyModePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "empty-auto-setup",
+        );
+        yield* driver.createWorktree({
+          cwd,
+          path: emptyModePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/empty-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-EMPTY",
+            taskSlug: "empty-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const emptyModeUpstream = yield* driver.execute({
+          operation: "test.emptyAutoSetup",
+          args: ["rev-parse", "--abbrev-ref", "@{upstream}"],
+          cwd: emptyModePath,
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(emptyModeUpstream.exitCode, 0);
       }),
     );
 
@@ -2003,6 +2031,58 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("expand-full refuses failed source identity and branch setup states", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "failed-source-identity",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/failed-source-identity",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-IDENTITY",
+            taskSlug: "failed-source-identity",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const state = JSON.parse(yield* fileSystem.readFileString(statePath));
+        yield* fileSystem.writeFileString(
+          statePath,
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          `${JSON.stringify({ ...state, status: "failed", reason: "materialized-head-mismatch" })}\n`,
+        );
+
+        const expansion = yield* Effect.result(
+          driver.expandWorktreeMaterializationFull(worktreePath, "must-refuse"),
+        );
+
+        assert.equal(expansion._tag, "Failure");
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const preserved = JSON.parse(yield* fileSystem.readFileString(statePath));
+        assert.equal(preserved.status, "failed");
+        assert.equal(preserved.reason, "materialized-head-mismatch");
+      }),
+    );
+
     it.effect("expand-full repopulates files when sparse config was already disabled", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2262,6 +2342,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
 
         assert.equal(created.materialization?.effectiveProfileId, "full");
         assert.equal(created.materialization?.reason, "task-card-materialization-failed");
+        assert.equal(created.materialization?.taskCardPath, null);
         assert.equal(created.materialization?.taskCardSha256, null);
         assert.equal(created.materialization?.requiredPaths.includes(taskCardPath), false);
         assert.equal(yield* fileSystem.exists(pathService.join(worktreePath, taskCardPath)), false);
