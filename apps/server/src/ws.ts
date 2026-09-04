@@ -1139,6 +1139,11 @@ const makeWsRpcLayer = (
                   ? { materialization: bootstrap.prepareWorktree.materialization }
                   : {}),
               });
+              if (bootstrap.prepareWorktree.materialization && !worktree.materialization) {
+                return yield* new OrchestrationDispatchCommandError({
+                  message: "Requested worktree materialization returned no persisted identity.",
+                });
+              }
               targetWorktreePath = worktree.worktree.path;
               yield* dispatchFromClient({
                 type: "thread.meta.update",
@@ -2448,7 +2453,11 @@ const makeWsRpcLayer = (
                     "expand-full requires the exact persisted worktree path for the named thread.",
                 });
               }
-              if (thread.session?.status === "starting" || thread.session?.status === "running") {
+              if (
+                thread.session &&
+                thread.session.status !== "stopped" &&
+                thread.session.status !== "error"
+              ) {
                 return yield* new OrchestrationDispatchCommandError({
                   message: "expand-full is unavailable while the thread session is active.",
                 });

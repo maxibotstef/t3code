@@ -8965,6 +8965,30 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       threadShell = makeDefaultOrchestrationThreadShell({
         id: threadId,
         worktreePath,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+      const readySession = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsExpandWorktreeMaterialization]({ cwd: worktreePath, threadId }),
+        ).pipe(Effect.result),
+      );
+      assertTrue(readySession._tag === "Failure");
+      assertTrue(readySession.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(readySession.failure.message, "thread session is active");
+      assert.equal(expandWorktreeMaterializationFull.mock.calls.length, 0);
+      assert.equal(dispatchedCommands.length, 0);
+
+      threadShell = makeDefaultOrchestrationThreadShell({
+        id: threadId,
+        worktreePath,
         session: null,
       });
       const response = yield* Effect.scoped(
@@ -9360,6 +9384,93 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           (command) =>
             command.type === "thread.materialization.set" || command.type === "thread.turn.start",
         ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("fails bootstrap closed when requested materialization returns no identity", () =>
+    Effect.gen(function* () {
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const materializationRequest = {
+        requestedProfileId: "governance-review",
+        expectedContractSha256: "a".repeat(64),
+        taskId: "OC-1",
+        taskSlug: "task",
+        taskCardPath: "ops/stef-task/task/stef-task.json",
+        scopePaths: ["docs/spec.md"],
+      } as const;
+      const createWorktree = vi.fn(
+        (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
+          Effect.succeed({
+            worktree: {
+              refName: "t3code/bootstrap-missing-materialization",
+              path: "/tmp/bootstrap-missing-materialization-worktree",
+            },
+          }),
+      );
+
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: { createWorktree },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: dispatchedCommands.length };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-bootstrap-missing-materialization"),
+            threadId: ThreadId.make("thread-bootstrap-missing-materialization"),
+            message: {
+              messageId: MessageId.make("msg-bootstrap-missing-materialization"),
+              role: "user",
+              text: "hello",
+              attachments: [],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId: defaultProjectId,
+                title: "Bootstrap Thread",
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt,
+              },
+              prepareWorktree: {
+                projectCwd: "/tmp/project",
+                baseBranch: "main",
+                branch: "t3code/bootstrap-missing-materialization",
+                materialization: materializationRequest,
+              },
+              runSetupScript: false,
+            },
+            createdAt,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "returned no persisted identity");
+      assert.strictEqual(result.failure.bootstrapThreadDisposition, "deleted");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.create", "thread.delete"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

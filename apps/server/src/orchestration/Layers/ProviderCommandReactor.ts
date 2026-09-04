@@ -1338,7 +1338,13 @@ const make = Effect.gen(function* () {
         });
       }
       return true;
-    }).pipe(Effect.catchCause((cause) => recoverTurnStartFailure(cause).pipe(Effect.as(false))));
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : recoverTurnStartFailure(cause).pipe(Effect.as(false)),
+      ),
+    );
     if (!materializationReady) return;
 
     const isCompactCommand = isCompactCommandMessage(message);
