@@ -140,6 +140,7 @@ const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(fun
     readonly requiredMissingEverywhere?: boolean;
     readonly invalidSharedPath?: boolean;
     readonly invalidSharedValue?: unknown;
+    readonly omitTaskCardCone?: boolean;
   } = {},
 ) {
   const contract = {
@@ -154,7 +155,9 @@ const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(fun
         ? [options.invalidSharedValue]
         : options.invalidSharedPath
           ? ["/absolute-cone"]
-          : ["config", "ops/stef-task", "ops/build-state"],
+          : options.omitTaskCardCone
+            ? ["config", "ops/build-state"]
+            : ["config", "ops/stef-task", "ops/build-state"],
     sharedRequiredPaths: ["config/worktree-materialization-profiles.json"],
     unsupportedTaskClasses: ["unclassified", "multi-domain", "live-runtime"],
     profiles: [
@@ -1987,6 +1990,118 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("preserves inherited ignores when full fallback revisits a generated task card", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          requiredOutsideCone: true,
+        });
+        const taskCardPath = "ops/stef-task/generated-fallback/stef-task.json";
+        yield* writeTextFile(cwd, taskCardPath, '{"issue":{"id":"OC-FALLBACK"}}\n');
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const inheritedExcludePath = pathService.join(
+          yield* makeTmpDir("git-global-excludes-"),
+          "global-excludes",
+        );
+        yield* fileSystem.writeFileString(inheritedExcludePath, "*.local-only\n");
+        yield* git(cwd, ["config", "core.excludesFile", inheritedExcludePath]);
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-task-card-fallback",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-task-card-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-FALLBACK",
+            taskSlug: "generated-fallback",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "required-paths-missing");
+        const worktreeExcludePath = yield* git(worktreePath, [
+          "config",
+          "--worktree",
+          "--get",
+          "core.excludesFile",
+        ]);
+        assert.equal(
+          yield* fileSystem.readFileString(worktreeExcludePath),
+          `*.local-only\n${taskCardPath}\n`,
+        );
+      }),
+    );
+
+    it.effect("preserves the default XDG Git ignore when adding a generated task card", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const taskCardPath = "ops/stef-task/generated-xdg/stef-task.json";
+        yield* writeTextFile(cwd, taskCardPath, '{"issue":{"id":"OC-XDG"}}\n');
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const xdgRoot = yield* makeTmpDir("git-xdg-config-");
+        const defaultExcludePath = pathService.join(xdgRoot, "git", "ignore");
+        yield* fileSystem.makeDirectory(pathService.dirname(defaultExcludePath), {
+          recursive: true,
+        });
+        yield* fileSystem.writeFileString(defaultExcludePath, "*.xdg-only\n");
+        const previousXdg = process.env.XDG_CONFIG_HOME;
+        process.env.XDG_CONFIG_HOME = xdgRoot;
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = previousXdg;
+          }),
+        );
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-task-card-xdg",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-task-card-xdg",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-XDG",
+            taskSlug: "generated-xdg",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        const worktreeExcludePath = yield* git(worktreePath, [
+          "config",
+          "--worktree",
+          "--get",
+          "core.excludesFile",
+        ]);
+        assert.equal(
+          yield* fileSystem.readFileString(worktreeExcludePath),
+          `*.xdg-only\n${taskCardPath}\n`,
+        );
+      }),
+    );
+
     it.effect("falls back to full when tracked task-card working bytes differ from the base", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2081,6 +2196,70 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
 
         assert.equal(created.materialization?.effectiveProfileId, "governance-review");
         assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "sparse");
+        const expanded = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "autocrlf-expand",
+        );
+        assert.equal(expanded.taskCardSha256, created.materialization?.taskCardSha256);
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("drops unsafe task-card paths from ordinary full state", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "unsafe-full-card"),
+          refName: initialBranch,
+          newRefName: "feature/unsafe-full-card",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256: "a".repeat(64),
+            taskId: "OC-FULL",
+            taskSlug: "unsafe-full",
+            taskCardPath: "../../outside.json",
+            scopePaths: ["../../outside.ts"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.taskCardPath, null);
+        assert.deepStrictEqual(created.materialization?.scopePaths, []);
+      }),
+    );
+
+    it.effect("falls back to full when the contract does not cone-cover task cards", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          omitTaskCardCone: true,
+        });
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "uncovered-card-root"),
+          refName: initialBranch,
+          newRefName: "feature/uncovered-card-root",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-CONE",
+            taskSlug: "uncovered-card-root",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "contract-unavailable");
       }),
     );
 
