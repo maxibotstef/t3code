@@ -109,8 +109,8 @@ export function resolveUiWorktreeMaterializationRequest(input: {
       };
     };
     const declared = card.materialization;
-    const verificationArgs = card.verification?.status === "declared" ? card.verification.args : {};
-    const verifierPathsValue = verificationArgs?.paths;
+    const verifierPathsValue =
+      card.verification?.status === "declared" ? card.verification.args?.paths : undefined;
     const verificationArgsValid =
       verifierPathsValue === undefined ||
       (Array.isArray(verifierPathsValue) &&
@@ -118,7 +118,7 @@ export function resolveUiWorktreeMaterializationRequest(input: {
           (candidate) => typeof candidate === "string" && candidate.trim().length > 0,
         ));
     const verifierPaths = verificationArgsValid
-      ? ((verifierPathsValue ?? []) as ReadonlyArray<string>)
+      ? ((verifierPathsValue ?? []) as ReadonlyArray<string>).map((candidate) => candidate.trim())
       : [];
     const normalizeIssueId = (value: unknown) =>
       String(value ?? "")
@@ -129,6 +129,18 @@ export function resolveUiWorktreeMaterializationRequest(input: {
     const selectedCardPath = input.taskCardPath.trim().replaceAll("\\", "/");
     const cardPathParts = selectedCardPath.split("/");
     const expectedTaskSlug = cardPathParts.length >= 2 ? cardPathParts.at(-2) : undefined;
+    const taskId = typeof declared?.taskId === "string" ? declared.taskId.trim() : "";
+    const taskSlug = typeof declared?.taskSlug === "string" ? declared.taskSlug.trim() : "";
+    const scopePaths = Array.isArray(declared?.scopePaths)
+      ? declared.scopePaths.map((scopePath) =>
+          typeof scopePath === "string" ? scopePath.trim() : scopePath,
+        )
+      : [];
+    const taskClasses = Array.isArray(declared?.taskClasses)
+      ? declared.taskClasses.map((taskClass) =>
+          typeof taskClass === "string" ? taskClass.trim() : taskClass,
+        )
+      : declared?.taskClasses;
     if (
       !declared ||
       !verificationArgsValid ||
@@ -137,22 +149,19 @@ export function resolveUiWorktreeMaterializationRequest(input: {
       typeof declared.expectedContractSha256 !== "string" ||
       !/^[a-f0-9]{64}$/.test(declared.expectedContractSha256) ||
       declared.expectedContractSha256 !== input.contractSha256 ||
-      typeof declared.taskId !== "string" ||
-      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(declared.taskId.trim()) ||
-      typeof declared.taskSlug !== "string" ||
-      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(declared.taskSlug.trim()) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(taskId) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(taskSlug) ||
       input.taskCardPath.trim().length === 0 ||
-      normalizeIssueId(card.issue?.id ?? card.issueId) !== normalizeIssueId(declared.taskId) ||
-      declared.taskSlug !== expectedTaskSlug ||
+      normalizeIssueId(card.issue?.id ?? card.issueId) !== normalizeIssueId(taskId) ||
+      taskSlug !== expectedTaskSlug ||
       declared.taskCardPath !== selectedCardPath ||
-      !Array.isArray(declared.scopePaths) ||
-      declared.scopePaths.length === 0 ||
-      declared.scopePaths.some(
+      scopePaths.length === 0 ||
+      scopePaths.some(
         (scopePath) => typeof scopePath !== "string" || scopePath.trim().length === 0,
       ) ||
       (declared.taskClasses !== undefined &&
-        (!Array.isArray(declared.taskClasses) ||
-          declared.taskClasses.some(
+        (!Array.isArray(taskClasses) ||
+          taskClasses.some(
             (taskClass) => typeof taskClass !== "string" || taskClass.trim().length === 0,
           )))
     ) {
@@ -161,11 +170,11 @@ export function resolveUiWorktreeMaterializationRequest(input: {
     return {
       requestedProfileId: declared.requestedProfileId,
       expectedContractSha256: declared.expectedContractSha256,
-      taskId: declared.taskId,
-      taskSlug: declared.taskSlug,
+      taskId,
+      taskSlug,
       taskCardPath: selectedCardPath,
-      scopePaths: [...new Set([...declared.scopePaths, ...verifierPaths])],
-      ...(Array.isArray(declared.taskClasses) ? { taskClasses: declared.taskClasses } : {}),
+      scopePaths: [...new Set([...(scopePaths as Array<string>), ...verifierPaths])],
+      ...(Array.isArray(taskClasses) ? { taskClasses: taskClasses as Array<string> } : {}),
       ...(declared.includeResearchTask === true ? { includeResearchTask: true } : {}),
     };
   } catch {
@@ -198,6 +207,9 @@ export function worktreeMaterializationPresentation(
 ): { readonly label: string; readonly canExpand: boolean; readonly fellBack: boolean } | null {
   if (state.requestedProfileId === "full" && state.effectiveProfileId === "full") return null;
   if (state.mode === "full") {
+    if (state.reason === "user-expand-full") {
+      return { label: "Expanded to full", canExpand: false, fellBack: false };
+    }
     return {
       label: `Requested ${state.requestedProfileId} → full${state.reason ? ` (${state.reason})` : ""}`,
       canExpand: false,

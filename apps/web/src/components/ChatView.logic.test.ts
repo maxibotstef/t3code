@@ -1322,6 +1322,32 @@ describe("worktree materialization selection", () => {
       }),
     });
     expect(withoutArgs?.scopePaths).toEqual(["docs/spec.md"]);
+
+    const trimmed = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        issue: { id: "OC-1" },
+        materialization: {
+          ...materialization,
+          taskId: " OC-1 ",
+          taskSlug: " task ",
+          scopePaths: [" docs/spec.md "],
+          taskClasses: [" source-task "],
+        },
+        verification: {
+          status: "declared",
+          args: { paths: [" scripts/test/materialization.test.js "] },
+        },
+      }),
+    });
+    expect(trimmed).toMatchObject({
+      taskId: "OC-1",
+      taskSlug: "task",
+      scopePaths: ["docs/spec.md", "scripts/test/materialization.test.js"],
+      taskClasses: ["source-task"],
+    });
   });
 
   it("builds a schema-valid unclassified sentinel that must fall back full", () => {
@@ -1380,6 +1406,21 @@ describe("worktree materialization selection", () => {
       canExpand: false,
       fellBack: true,
     });
+    expect(
+      worktreeMaterializationPresentation({
+        requestedProfileId: "governance-review",
+        effectiveProfileId: "full",
+        mode: "full",
+        reason: "user-expand-full",
+        expectedContractSha256: null,
+        contractSha256: null,
+        manifestSha256: null,
+        conePaths: [],
+        requiredPaths: [],
+        taskId: null,
+        taskSlug: null,
+      }),
+    ).toEqual({ label: "Expanded to full", canExpand: false, fellBack: false });
     expect(
       worktreeMaterializationPresentation({
         requestedProfileId: "governance-review",

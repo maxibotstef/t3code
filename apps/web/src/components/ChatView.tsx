@@ -4956,7 +4956,9 @@ function ChatViewContent(props: ChatViewProps) {
     setMaterializationExpandPending(false);
   }, [activeProject?.id, activeThread?.id]);
   const materializationContractQuery = useEnvironmentQuery(
-    activeProject && envMode === "worktree"
+    activeProject &&
+      envMode === "worktree" &&
+      (isLocalDraftThread || canOverrideServerThreadEnvMode)
       ? projectEnvironment.readFile({
           environmentId,
           input: {
@@ -4969,6 +4971,7 @@ function ChatViewContent(props: ChatViewProps) {
   const materializationTaskCardQuery = useEnvironmentQuery(
     activeProject &&
       envMode === "worktree" &&
+      (isLocalDraftThread || canOverrideServerThreadEnvMode) &&
       debouncedMaterializationTaskCardPath.trim().length > 0
       ? projectEnvironment.readFile({
           environmentId,
