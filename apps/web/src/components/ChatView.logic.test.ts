@@ -1281,6 +1281,49 @@ describe("worktree materialization selection", () => {
     ).toBeUndefined();
   });
 
+  it("reads only declared verifier paths and accepts other typed verifier arguments", () => {
+    const sha = "a".repeat(64);
+    const materialization = {
+      requestedProfileId: "governance-review",
+      expectedContractSha256: sha,
+      taskId: "OC-1",
+      taskSlug: "task",
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+      taskClasses: ["source-task"],
+    };
+    const withArgs = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        issue: { id: "OC-1" },
+        materialization,
+        verification: {
+          status: "declared",
+          args: {
+            paths: ["scripts/test/materialization.test.js"],
+            tags: ["not-a-path"],
+            timeout: 300,
+          },
+        },
+      }),
+    });
+    expect(withArgs?.scopePaths).toEqual(["docs/spec.md", "scripts/test/materialization.test.js"]);
+
+    const withoutArgs = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        issue: { id: "OC-1" },
+        materialization,
+        verification: { status: "declared" },
+      }),
+    });
+    expect(withoutArgs?.scopePaths).toEqual(["docs/spec.md"]);
+  });
+
   it("builds a schema-valid unclassified sentinel that must fall back full", () => {
     const sha = "a".repeat(64);
     expect(

@@ -110,18 +110,15 @@ export function resolveUiWorktreeMaterializationRequest(input: {
     };
     const declared = card.materialization;
     const verificationArgs = card.verification?.status === "declared" ? card.verification.args : {};
+    const verifierPathsValue = verificationArgs?.paths;
     const verificationArgsValid =
-      verificationArgs !== undefined &&
-      verificationArgs !== null &&
-      typeof verificationArgs === "object" &&
-      !Array.isArray(verificationArgs) &&
-      Object.values(verificationArgs).every(
-        (value) =>
-          Array.isArray(value) &&
-          value.every((candidate) => typeof candidate === "string" && candidate.trim().length > 0),
-      );
+      verifierPathsValue === undefined ||
+      (Array.isArray(verifierPathsValue) &&
+        verifierPathsValue.every(
+          (candidate) => typeof candidate === "string" && candidate.trim().length > 0,
+        ));
     const verifierPaths = verificationArgsValid
-      ? Object.values(verificationArgs ?? {}).flatMap((value) => value as ReadonlyArray<string>)
+      ? ((verifierPathsValue ?? []) as ReadonlyArray<string>)
       : [];
     const normalizeIssueId = (value: unknown) =>
       String(value ?? "")
