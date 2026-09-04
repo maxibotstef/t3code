@@ -1579,6 +1579,9 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* git(cwd, ["push", "origin", initialBranch]);
         yield* git(cwd, ["fetch", "origin"]);
         yield* git(cwd, ["config", "branch.autoSetupMerge", "true"]);
+        yield* writeTextFile(cwd, "local-only.txt", "local divergence\n");
+        yield* git(cwd, ["add", "local-only.txt"]);
+        yield* git(cwd, ["commit", "-m", "local divergence"]);
         const pathService = yield* Path.Path;
         const worktreePath = pathService.join(
           yield* makeTmpDir("git-worktrees-"),
@@ -1606,6 +1609,10 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(
           yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
           yield* git(cwd, ["rev-parse", `origin/${initialBranch}^{commit}`]),
+        );
+        assert.notEqual(
+          yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
+          yield* git(cwd, ["rev-parse", `${initialBranch}^{commit}`]),
         );
         assert.equal(
           yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
@@ -2584,6 +2591,8 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           "--get",
           "core.excludesFile",
         ]);
+        assert.notEqual(worktreeExcludePath, defaultExcludePath);
+        assert.equal(yield* fileSystem.readFileString(defaultExcludePath), "*.xdg-only\n");
         assert.equal(
           yield* fileSystem.readFileString(worktreeExcludePath),
           `*.xdg-only\n${taskCardPath}\n`,
