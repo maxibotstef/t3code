@@ -157,9 +157,9 @@ const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(fun
     },
     sharedConePaths:
       options.invalidSharedValue !== undefined
-        ? [options.invalidSharedValue]
+        ? ["config", "ops/stef-task", "ops/build-state", options.invalidSharedValue]
         : options.invalidSharedPath
-          ? ["/absolute-cone"]
+          ? ["config", "ops/stef-task", "ops/build-state", "/absolute-cone"]
           : options.omitTaskCardCone
             ? ["config", "ops/build-state"]
             : ["config", "ops/stef-task", "ops/build-state"],
@@ -217,6 +217,7 @@ const logicalWorkingTreeBytes = (
     const pathService = yield* Path.Path;
     const visit = (candidate: string): Effect.Effect<number, PlatformError.PlatformError> =>
       Effect.gen(function* () {
+        if (Option.isSome(yield* fileSystem.readLink(candidate).pipe(Effect.option))) return 0;
         const infoOption = yield* fileSystem.stat(candidate).pipe(Effect.option);
         if (Option.isNone(infoOption)) return 0;
         const info = infoOption.value;
