@@ -1195,20 +1195,39 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ...(cause === undefined ? {} : { cause }),
     });
 
+  const readMaterializationBlobAtCommit = Effect.fn("readMaterializationBlobAtCommit")(function* (
+    repoRoot: string,
+    pinnedCommit: string,
+    relativePath: string,
+    operation: string,
+  ) {
+    const shown = yield* Effect.exit(
+      executeGit(operation, repoRoot, ["show", `${pinnedCommit}:${relativePath}`]),
+    );
+    if (
+      Exit.isFailure(shown) ||
+      shown.value.stdoutTruncated ||
+      shown.value.stdoutInvalidUtf8 === true
+    ) {
+      return null;
+    }
+    return new TextEncoder().encode(shown.value.stdout);
+  });
+
   const readMaterializationContract = Effect.fn("readMaterializationContract")(function* (
     repoRoot: string,
     pinnedCommit?: string,
   ) {
     let raw: Uint8Array;
     if (pinnedCommit) {
-      const shown = yield* Effect.exit(
-        executeGit("GitVcsDriver.materialization.readContractAtBase", repoRoot, [
-          "show",
-          `${pinnedCommit}:${WORKTREE_MATERIALIZATION_CONTRACT_PATH}`,
-        ]),
+      const shown = yield* readMaterializationBlobAtCommit(
+        repoRoot,
+        pinnedCommit,
+        WORKTREE_MATERIALIZATION_CONTRACT_PATH,
+        "GitVcsDriver.materialization.readContractAtBase",
       );
-      if (Exit.isFailure(shown) || shown.value.stdoutTruncated) return null;
-      raw = new TextEncoder().encode(shown.value.stdout);
+      if (!shown) return null;
+      raw = shown;
     } else {
       const file = yield* Effect.exit(
         fileSystem.readFile(path.join(repoRoot, WORKTREE_MATERIALIZATION_CONTRACT_PATH)),
@@ -1268,15 +1287,12 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       if (Exit.isSuccess(source)) sourceTaskCardBytes = source.value;
     }
     if (taskCardAtBase.exitCode === 0) {
-      const shown = yield* Effect.exit(
-        executeGit("GitVcsDriver.materialization.taskCardBytesAtBase", repoRoot, [
-          "show",
-          `${pinnedCommit}:${taskCardPath}`,
-        ]),
+      taskCardBytes = yield* readMaterializationBlobAtCommit(
+        repoRoot,
+        pinnedCommit,
+        taskCardPath,
+        "GitVcsDriver.materialization.taskCardBytesAtBase",
       );
-      if (Exit.isSuccess(shown) && !shown.value.stdoutTruncated) {
-        taskCardBytes = new TextEncoder().encode(shown.value.stdout);
-      }
       if (
         taskCardBytes &&
         sourceTaskCardBytes &&
@@ -1357,7 +1373,31 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       )).trim();
       const gitDir = path.isAbsolute(gitDirRaw) ? gitDirRaw : path.resolve(worktreePath, gitDirRaw);
       const excludePath = path.join(gitDir, "worktree-materialization-excludes");
-      yield* fileSystem.writeFileString(excludePath, `${state.taskCardPath}\n`);
+      const inheritedExclude = yield* executeGit(
+        "GitVcsDriver.materialization.inheritedTaskCardExclude",
+        worktreePath,
+        ["config", "--path", "--get", "core.excludesFile"],
+        { allowNonZeroExit: true },
+      );
+      const inheritedExcludePath =
+        inheritedExclude.exitCode === 0 ? inheritedExclude.stdout.trim() : "";
+      const inheritedExcludeBytes =
+        inheritedExcludePath && path.resolve(inheritedExcludePath) !== path.resolve(excludePath)
+          ? yield* Effect.exit(fileSystem.readFileString(inheritedExcludePath))
+          : null;
+      const inheritedPatterns =
+        inheritedExcludeBytes && Exit.isSuccess(inheritedExcludeBytes)
+          ? inheritedExcludeBytes.value
+          : "";
+      yield* fileSystem.writeFileString(
+        excludePath,
+        `${inheritedPatterns}${inheritedPatterns && !inheritedPatterns.endsWith("\n") ? "\n" : ""}${state.taskCardPath}\n`,
+      );
+      yield* runGit("GitVcsDriver.materialization.enableWorktreeConfig", repoRoot, [
+        "config",
+        "extensions.worktreeConfig",
+        "true",
+      ]);
       yield* runGit("GitVcsDriver.materialization.taskCardExclude", worktreePath, [
         "config",
         "--worktree",
@@ -1367,7 +1407,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     });
     const target = yield* Effect.exit(fileSystem.readFile(targetPath));
     if (Exit.isSuccess(target)) {
-      if (worktreeMaterializationSha256(target.value) !== state.taskCardSha256) {
+      const identityMatches = state.taskCardGenerated
+        ? worktreeMaterializationSha256(target.value) === state.taskCardSha256
+        : yield* taskCardIdentityMatches(worktreePath, state);
+      if (!identityMatches) {
         return yield* materializationError(
           "GitVcsDriver.materialization.taskCard",
           worktreePath,
@@ -1406,8 +1449,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       );
     }
     yield* fileSystem.makeDirectory(path.dirname(targetPath), { recursive: true });
-    yield* fileSystem.writeFile(targetPath, source);
     yield* configureIgnore();
+    yield* fileSystem.writeFile(targetPath, source);
   });
 
   const materializationStatePath = Effect.fn("materializationStatePath")(function* (cwd: string) {
@@ -1518,6 +1561,28 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     state: VcsWorktreeMaterializationState,
   ) {
     if (!state.taskCardPath || !state.taskCardSha256) return true;
+    if (!state.taskCardGenerated && state.baseSha) {
+      const repoRoot = (yield* runGitStdout("GitVcsDriver.materialization.taskCardRepoRoot", cwd, [
+        "rev-parse",
+        "--show-toplevel",
+      ])).trim();
+      const baseBytes = yield* readMaterializationBlobAtCommit(
+        repoRoot,
+        state.baseSha,
+        state.taskCardPath,
+        "GitVcsDriver.materialization.verifyTaskCardAtBase",
+      );
+      if (!baseBytes || worktreeMaterializationSha256(baseBytes) !== state.taskCardSha256) {
+        return false;
+      }
+      const diff = yield* executeGit(
+        "GitVcsDriver.materialization.verifyTaskCardWorktree",
+        cwd,
+        ["diff", "--quiet", state.baseSha, "--", state.taskCardPath],
+        { allowNonZeroExit: true },
+      );
+      return diff.exitCode === 0;
+    }
     const loaded = yield* Effect.exit(fileSystem.readFile(path.join(cwd, state.taskCardPath)));
     return (
       Exit.isSuccess(loaded) && worktreeMaterializationSha256(loaded.value) === state.taskCardSha256
@@ -1613,8 +1678,18 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       "rev-parse",
       "--show-toplevel",
     ])).trim();
-    const contract = yield* readMaterializationContract(repoRoot);
-    if (!contract || contract.sha256 !== persisted.contractSha256) {
+    const contract = persisted.baseSha
+      ? yield* readMaterializationContract(repoRoot, persisted.baseSha)
+      : null;
+    const contractDiff = persisted.baseSha
+      ? yield* executeGit(
+          "GitVcsDriver.materialization.verifyContractWorktree",
+          cwd,
+          ["diff", "--quiet", persisted.baseSha, "--", WORKTREE_MATERIALIZATION_CONTRACT_PATH],
+          { allowNonZeroExit: true },
+        )
+      : null;
+    if (!contract || contract.sha256 !== persisted.contractSha256 || contractDiff?.exitCode !== 0) {
       return yield* materializationError(
         "GitVcsDriver.verifyWorktreeMaterialization",
         cwd,
@@ -1651,15 +1726,21 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         "Sparse index is forbidden for materialized worktrees.",
       );
     }
-    const observedCone = uniqueMaterializationPaths(
-      (yield* runGitStdout("GitVcsDriver.materialization.sparseList", cwd, [
-        "sparse-checkout",
-        "list",
-      ]))
-        .split(/\r?\n/)
-        .map(normalizeMaterializationRepoPath)
-        .filter((candidate): candidate is string => candidate !== null),
-    );
+    const observedConePaths = (yield* runGitStdout("GitVcsDriver.materialization.sparseList", cwd, [
+      "sparse-checkout",
+      "list",
+    ]))
+      .split(/\r?\n/)
+      .filter((candidate) => candidate.length > 0)
+      .map(normalizeMaterializationRepoPath);
+    if (observedConePaths.some((candidate) => candidate === null)) {
+      return yield* materializationError(
+        "GitVcsDriver.verifyWorktreeMaterialization",
+        cwd,
+        "Git sparse cone contains an invalid path.",
+      );
+    }
+    const observedCone = uniqueMaterializationPaths(observedConePaths as Array<string>);
     // @effect-diagnostics-next-line preferSchemaOverJson:off
     if (JSON.stringify(observedCone) !== JSON.stringify(conePaths)) {
       return yield* materializationError(
@@ -3675,6 +3756,23 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
     });
 
+    if (input.newRefName) {
+      const remoteStart = yield* executeGit(
+        "GitVcsDriver.createWorktree.remoteStart",
+        repoRoot,
+        ["show-ref", "--verify", "--quiet", `refs/remotes/${input.refName}`],
+        { allowNonZeroExit: true },
+      );
+      if (remoteStart.exitCode === 0) {
+        yield* runGit("GitVcsDriver.createWorktree.preserveUpstream", repoRoot, [
+          "branch",
+          "--set-upstream-to",
+          input.refName,
+          input.newRefName,
+        ]);
+      }
+    }
+
     let materialization: VcsWorktreeMaterializationState = requestedMaterialization;
     if (requestedMaterialization.mode === "sparse") {
       let fallbackReason: string | null = null;
@@ -3768,27 +3866,43 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             `${fallbackReason}; full fallback checkout failed. The never-released worktree was preserved for diagnosis.`,
           );
         }
-        const fullTaskCard = yield* Effect.exit(
-          ensureMaterializedTaskCard(repoRoot, worktreePath, requestedMaterialization),
-        );
-        if (Exit.isFailure(fullTaskCard)) {
-          const failedState: VcsWorktreeMaterializationState = {
-            ...requestedMaterialization,
-            status: "failed",
-            effectiveProfileId: "full",
-            mode: "full",
-            reason: `${fallbackReason}:full-fallback-task-card-failed`,
-          };
-          yield* writeMaterializationState(worktreePath, failedState);
-          return yield* materializationError(
-            "GitVcsDriver.createWorktree",
-            worktreePath,
-            `${fallbackReason}; full fallback could not materialize the exact task card. The never-released worktree was preserved for diagnosis.`,
+        const dropTaskCardIdentity = fallbackReason === "task-card-materialization-failed";
+        const fullMaterialization: VcsWorktreeMaterializationState = {
+          ...requestedMaterialization,
+          effectiveProfileId: "full",
+          mode: "full",
+          reason: fallbackReason,
+          ...(dropTaskCardIdentity
+            ? {
+                taskCardSha256: null,
+                taskCardGenerated: false,
+                requiredPaths: requestedMaterialization.requiredPaths.filter(
+                  (candidate) => candidate !== requestedMaterialization.taskCardPath,
+                ),
+              }
+            : {}),
+        };
+        if (!dropTaskCardIdentity) {
+          const fullTaskCard = yield* Effect.exit(
+            ensureMaterializedTaskCard(repoRoot, worktreePath, fullMaterialization),
           );
+          if (Exit.isFailure(fullTaskCard)) {
+            const failedState: VcsWorktreeMaterializationState = {
+              ...fullMaterialization,
+              status: "failed",
+              reason: `${fallbackReason}:full-fallback-task-card-failed`,
+            };
+            yield* writeMaterializationState(worktreePath, failedState);
+            return yield* materializationError(
+              "GitVcsDriver.createWorktree",
+              worktreePath,
+              `${fallbackReason}; full fallback could not materialize the exact task card. The never-released worktree was preserved for diagnosis.`,
+            );
+          }
         }
         const missing = yield* requiredMaterializationPathsMissing(
           worktreePath,
-          requestedMaterialization.requiredPaths,
+          fullMaterialization.requiredPaths,
         );
         if (missing.length > 0) {
           const failedState: VcsWorktreeMaterializationState = {
@@ -3805,14 +3919,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             `${fallbackReason}; full fallback is missing required path(s): ${missing.join(", ")}. The never-released worktree was preserved for diagnosis.`,
           );
         }
-        materialization = {
-          ...requestedMaterialization,
-          effectiveProfileId: "full",
-          mode: "full",
-          reason: fallbackReason,
-        };
+        materialization = fullMaterialization;
       }
     } else {
+      if (yield* sparseCheckoutEnabled(worktreePath)) {
+        yield* runGit(
+          "GitVcsDriver.createWorktree.disableInheritedSparse",
+          worktreePath,
+          ["sparse-checkout", "disable"],
+          { timeoutMs: WORKTREE_ADD_TIMEOUT_MS },
+        );
+      }
       const fullCheckout = yield* Effect.exit(
         runGit(
           "GitVcsDriver.createWorktree.checkoutFull",
@@ -3889,7 +4006,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
     }
     yield* writeMaterializationState(worktreePath, materialization);
-    materialization = yield* verifyWorktreeMaterialization(worktreePath);
+    materialization = yield* verifyWorktreeMaterialization(worktreePath).pipe(
+      Effect.tapError(() =>
+        writeMaterializationState(worktreePath, {
+          ...materialization,
+          status: "failed",
+          reason: "post-create-verification-failed",
+        }),
+      ),
+    );
 
     // `git worktree add` leaves submodules empty, so a repo that keeps agent
     // skills, tooling or source in one gets a worktree that is quietly missing
