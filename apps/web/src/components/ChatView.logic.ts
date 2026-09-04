@@ -182,6 +182,27 @@ export function resolveUiWorktreeMaterializationRequest(input: {
   }
 }
 
+export function resolveMaterializationTaskCardRead(input: {
+  readonly enabled: boolean;
+  readonly requestedProfileId: string;
+  readonly taskCardPath: string;
+  readonly debouncedTaskCardPath: string;
+  readonly isPending: boolean;
+  readonly isError: boolean;
+  readonly data: { readonly contents: string; readonly truncated: boolean } | null | undefined;
+}): { readonly pending: boolean; readonly contents: string | null } {
+  if (!input.enabled || input.requestedProfileId === "full" || !input.taskCardPath.trim()) {
+    return { pending: false, contents: null };
+  }
+  const pathMatches = input.taskCardPath.trim() === input.debouncedTaskCardPath.trim();
+  const pending = !pathMatches || (input.isPending && !input.isError);
+  return {
+    pending,
+    contents:
+      !pending && !input.isError && input.data?.truncated === false ? input.data.contents : null,
+  };
+}
+
 export function buildUiWorktreeMaterializationRequest(input: {
   readonly requestedProfileId: string;
   readonly contractSha256: string | null;

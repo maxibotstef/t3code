@@ -389,6 +389,7 @@ import {
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   buildUiWorktreeMaterializationRequest,
+  resolveMaterializationTaskCardRead,
   parseWorktreeMaterializationUiContract,
   worktreeMaterializationPresentation,
   revokeBlobPreviewUrl,
@@ -4968,10 +4969,14 @@ function ChatViewContent(props: ChatViewProps) {
         })
       : null,
   );
+  const materializationSelectionEnabled = Boolean(
+    activeProject &&
+    envMode === "worktree" &&
+    (isLocalDraftThread || canOverrideServerThreadEnvMode),
+  );
   const materializationTaskCardQuery = useEnvironmentQuery(
     activeProject &&
-      envMode === "worktree" &&
-      (isLocalDraftThread || canOverrideServerThreadEnvMode) &&
+      materializationSelectionEnabled &&
       debouncedMaterializationTaskCardPath.trim().length > 0
       ? projectEnvironment.readFile({
           environmentId,
@@ -5010,30 +5015,29 @@ function ChatViewContent(props: ChatViewProps) {
       setRequestedMaterializationProfileId("full");
     }
   }, [materializationContract, requestedMaterializationProfileId]);
+  const materializationTaskCardRead = resolveMaterializationTaskCardRead({
+    enabled: materializationSelectionEnabled,
+    requestedProfileId: requestedMaterializationProfileId,
+    taskCardPath: materializationTaskCardPath,
+    debouncedTaskCardPath: debouncedMaterializationTaskCardPath,
+    isPending: materializationTaskCardQuery.isPending,
+    isError: materializationTaskCardQuery.error !== null,
+    data: materializationTaskCardQuery.data,
+  });
   const requestedWorktreeMaterialization = useMemo(() => {
-    const taskCardPathMatches =
-      debouncedMaterializationTaskCardPath.trim() === materializationTaskCardPath.trim();
     return buildUiWorktreeMaterializationRequest({
       requestedProfileId: requestedMaterializationProfileId,
       contractSha256: materializationContractSha256,
-      taskCardContents:
-        taskCardPathMatches && materializationTaskCardQuery.data?.truncated === false
-          ? materializationTaskCardQuery.data.contents
-          : null,
+      taskCardContents: materializationTaskCardRead.contents,
       taskCardPath: materializationTaskCardPath,
     });
   }, [
     materializationContractSha256,
-    debouncedMaterializationTaskCardPath,
     materializationTaskCardPath,
-    materializationTaskCardQuery.data?.contents,
+    materializationTaskCardRead.contents,
     requestedMaterializationProfileId,
   ]);
-  const materializationTaskCardReadPending =
-    requestedMaterializationProfileId !== "full" &&
-    materializationTaskCardPath.trim().length > 0 &&
-    (debouncedMaterializationTaskCardPath.trim() !== materializationTaskCardPath.trim() ||
-      materializationTaskCardQuery.isPending);
+  const materializationTaskCardReadPending = materializationTaskCardRead.pending;
   const activeMaterializationPresentation = useMemo(
     () =>
       activeThread
@@ -6206,6 +6210,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       threadDetailLoading ||
+      materializationTaskCardReadPending ||
       sendInFlightRef.current ||
       feedbackUploadsInFlightRef.current.has(routeThreadKey)
     ) {
@@ -8049,7 +8054,9 @@ function ChatViewContent(props: ChatViewProps) {
                                 ? "Sending feedback"
                                 : threadDetailLoading
                                   ? "Messages loading"
-                                  : null
+                                  : materializationTaskCardReadPending
+                                    ? "Reading task card"
+                                    : null
                             }
                             isPreparingWorktree={isPreparingWorktree}
                             bannerItems={composerBannerItems}
@@ -8177,6 +8184,11 @@ function ChatViewContent(props: ChatViewProps) {
                                         }
                                       />
                                     </label>
+                                  ) : null}
+                                  {materializationTaskCardReadPending ? (
+                                    <span role="status" className="text-muted-foreground">
+                                      Reading task card. Sending will be available when it finishes.
+                                    </span>
                                   ) : null}
                                   {requestedMaterializationProfileId !== "full" &&
                                   !materializationTaskCardReadPending &&

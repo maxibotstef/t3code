@@ -43,6 +43,7 @@ import {
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   buildUiWorktreeMaterializationRequest,
+  resolveMaterializationTaskCardRead,
   parseWorktreeMaterializationUiContract,
   resolveUiWorktreeMaterializationRequest,
   worktreeMaterializationPresentation,
@@ -1348,6 +1349,67 @@ describe("worktree materialization selection", () => {
       scopePaths: ["docs/spec.md", "scripts/test/materialization.test.js"],
       taskClasses: ["source-task"],
     });
+  });
+
+  it("waits for a selected card without reusing stale or truncated content", () => {
+    const ready = {
+      enabled: true,
+      requestedProfileId: "governance-review",
+      taskCardPath: "ops/stef-task/new/stef-task.json",
+      debouncedTaskCardPath: "ops/stef-task/new/stef-task.json",
+      isPending: false,
+      isError: false,
+      data: { contents: "card", truncated: false },
+    };
+    expect(resolveMaterializationTaskCardRead(ready)).toEqual({ pending: false, contents: "card" });
+    expect(resolveMaterializationTaskCardRead({ ...ready, isPending: true })).toEqual({
+      pending: true,
+      contents: null,
+    });
+    expect(
+      resolveMaterializationTaskCardRead({
+        ...ready,
+        debouncedTaskCardPath: "ops/stef-task/old/stef-task.json",
+      }),
+    ).toEqual({ pending: true, contents: null });
+    for (const data of [undefined, { contents: "card", truncated: true }]) {
+      expect(resolveMaterializationTaskCardRead({ ...ready, data })).toEqual({
+        pending: false,
+        contents: null,
+      });
+    }
+    const failed = resolveMaterializationTaskCardRead({ ...ready, isError: true });
+    expect(failed).toEqual({ pending: false, contents: null });
+    expect(
+      buildUiWorktreeMaterializationRequest({
+        requestedProfileId: ready.requestedProfileId,
+        contractSha256: "a".repeat(64),
+        taskCardPath: ready.taskCardPath,
+        taskCardContents: failed.contents,
+      })?.taskClasses,
+    ).toEqual(["unclassified"]);
+  });
+
+  it("does not block sending when card reading is disabled, cleared, or full is selected", () => {
+    const pending = {
+      enabled: true,
+      requestedProfileId: "governance-review",
+      taskCardPath: "ops/stef-task/new/stef-task.json",
+      debouncedTaskCardPath: "ops/stef-task/old/stef-task.json",
+      isPending: true,
+      isError: false,
+      data: undefined,
+    };
+    for (const changed of [
+      { enabled: false },
+      { requestedProfileId: "full" },
+      { taskCardPath: " " },
+    ]) {
+      expect(resolveMaterializationTaskCardRead({ ...pending, ...changed })).toEqual({
+        pending: false,
+        contents: null,
+      });
+    }
   });
 
   it("builds a schema-valid unclassified sentinel that must fall back full", () => {
