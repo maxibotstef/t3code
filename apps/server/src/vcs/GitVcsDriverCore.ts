@@ -872,18 +872,36 @@ const createTrace2Monitor = Effect.fn("createTrace2Monitor")(function* (
   };
 });
 
+function decodeUtf8ChunkIsValid(
+  decoder: TextDecoder,
+  chunk?: Uint8Array,
+  options?: { readonly stream?: boolean },
+): boolean {
+  try {
+    decoder.decode(chunk, options);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const collectOutput = Effect.fnUntraced(function* (
   input: Pick<GitVcsDriver.ExecuteGitInput, "operation" | "cwd" | "args">,
   stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
   maxOutputBytes: number,
   appendTruncationMarker: boolean,
   onLine: ((line: string) => Effect.Effect<void, never>) | undefined,
-): Effect.fn.Return<{ readonly text: string; readonly truncated: boolean }, GitCommandError> {
+): Effect.fn.Return<
+  { readonly text: string; readonly truncated: boolean; readonly invalidUtf8: boolean },
+  GitCommandError
+> {
   const decoder = new TextDecoder();
+  const utf8Validator = new TextDecoder("utf-8", { fatal: true });
   let bytes = 0;
   let text = "";
   let lineBuffer = "";
   let truncated = false;
+  let invalidUtf8 = false;
 
   const emitCompleteLines = Effect.fnUntraced(function* (flush: boolean) {
     let newlineIndex = lineBuffer.indexOf("\n");
@@ -926,6 +944,12 @@ const collectOutput = Effect.fnUntraced(function* (
     truncated = appendTruncationMarker && nextBytes > maxOutputBytes;
 
     const decoded = decoder.decode(chunkToDecode, { stream: !truncated });
+    if (
+      !invalidUtf8 &&
+      !decodeUtf8ChunkIsValid(utf8Validator, chunkToDecode, { stream: !truncated })
+    ) {
+      invalidUtf8 = true;
+    }
     text += decoded;
     lineBuffer += decoded;
     yield* emitCompleteLines(false);
@@ -943,12 +967,16 @@ const collectOutput = Effect.fnUntraced(function* (
   );
 
   const remainder = truncated ? "" : decoder.decode();
+  if (!truncated && !invalidUtf8 && !decodeUtf8ChunkIsValid(utf8Validator)) {
+    invalidUtf8 = true;
+  }
   text += remainder;
   lineBuffer += remainder;
   yield* emitCompleteLines(true);
   return {
     text,
     truncated,
+    invalidUtf8,
   };
 });
 
@@ -1063,6 +1091,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           stderr: stderr.text,
           stdoutTruncated: stdout.truncated,
           stderrTruncated: stderr.truncated,
+          stdoutInvalidUtf8: stdout.invalidUtf8,
+          stderrInvalidUtf8: stderr.invalidUtf8,
         } satisfies GitVcsDriver.ExecuteGitResult;
       });
 
