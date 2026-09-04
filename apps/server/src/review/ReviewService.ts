@@ -99,6 +99,9 @@ export const make = Effect.gen(function* () {
         sources: [],
       };
     }
+    if (handle.kind === "git") {
+      yield* git.verifyWorktreeMaterialization(input.cwd);
+    }
 
     const getDriverDiffPreview = handle.driver.getDiffPreview;
     if (!getDriverDiffPreview) {
@@ -128,6 +131,8 @@ export const make = Effect.gen(function* () {
         detail: "Unchanged diff expansion currently requires a Git repository.",
       });
     }
+
+    yield* git.verifyWorktreeMaterialization(input.cwd);
 
     return yield* git.getReviewDiffFileContents(input);
   });

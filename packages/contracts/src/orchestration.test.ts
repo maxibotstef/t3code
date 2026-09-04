@@ -65,6 +65,33 @@ const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 const decodeDispatchCommandError = Schema.decodeUnknownEffect(OrchestrationDispatchCommandError);
 
+it.effect("keeps materialization persistence off the client command surface", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.result(
+      decodeClientOrchestrationCommand({
+        type: "thread.materialization.set",
+        commandId: "cmd-forged-materialization",
+        threadId: "thread-1",
+        materialization: {
+          requestedProfileId: "governance-review",
+          effectiveProfileId: "governance-review",
+          mode: "sparse",
+          reason: null,
+          expectedContractSha256: "a".repeat(64),
+          contractSha256: "a".repeat(64),
+          manifestSha256: "b".repeat(64),
+          conePaths: ["docs"],
+          requiredPaths: ["docs/spec.md"],
+          taskId: "OC-1",
+          taskSlug: "task",
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
 it.effect("decodes a dispatch error after its bootstrap thread was deleted", () =>
   Effect.gen(function* () {
     const error = yield* decodeDispatchCommandError({

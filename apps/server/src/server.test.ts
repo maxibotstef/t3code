@@ -41,6 +41,7 @@ import {
   WS_METHODS,
   WsRpcGroup,
   EditorId,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
 } from "@t3tools/contracts";
 import {
   computeDpopAccessTokenHash,
@@ -8872,6 +8873,130 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("binds expand-full to an inactive thread path and persists the result", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-expand-materialization");
+      const worktreePath = "/tmp/thread-expand-materialization";
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const expandedMaterialization = {
+        ...FULL_WORKTREE_MATERIALIZATION_STATE,
+        reason: "operator-recovery",
+      };
+      const expandWorktreeMaterializationFull = vi.fn((cwd: string, reason: string) =>
+        Effect.succeed({
+          ...expandedMaterialization,
+          reason: `${reason}:${cwd}`,
+        }),
+      );
+      const refreshStatus = vi.fn((_: string) =>
+        Effect.succeed({
+          isRepo: true,
+          hasPrimaryRemote: true,
+          isDefaultRef: false,
+          refName: "feature/expand",
+          hasWorkingTreeChanges: false,
+          workingTree: { files: [], insertions: 0, deletions: 0 },
+          hasUpstream: true,
+          aheadCount: 0,
+          behindCount: 0,
+          pr: null,
+        }),
+      );
+      let threadShell: OrchestrationThreadShell = makeDefaultOrchestrationThreadShell({
+        id: threadId,
+        worktreePath,
+        session: null,
+      });
+
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: { expandWorktreeMaterializationFull },
+          vcsStatusBroadcaster: { refreshStatus },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: dispatchedCommands.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: () => Effect.succeed(Option.some(threadShell)),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const pathMismatch = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsExpandWorktreeMaterialization]({
+            cwd: "/tmp/not-the-thread-worktree",
+            threadId,
+          }),
+        ).pipe(Effect.result),
+      );
+      assertTrue(pathMismatch._tag === "Failure");
+      assertTrue(pathMismatch.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(pathMismatch.failure.message, "exact persisted worktree path");
+
+      threadShell = makeDefaultOrchestrationThreadShell({
+        id: threadId,
+        worktreePath,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+      const activeSession = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsExpandWorktreeMaterialization]({ cwd: worktreePath, threadId }),
+        ).pipe(Effect.result),
+      );
+      assertTrue(activeSession._tag === "Failure");
+      assertTrue(activeSession.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(activeSession.failure.message, "thread session is active");
+      assert.equal(expandWorktreeMaterializationFull.mock.calls.length, 0);
+      assert.equal(dispatchedCommands.length, 0);
+
+      threadShell = makeDefaultOrchestrationThreadShell({
+        id: threadId,
+        worktreePath,
+        session: null,
+      });
+      const response = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsExpandWorktreeMaterialization]({
+            cwd: worktreePath,
+            threadId,
+            reason: "operator-recovery",
+          }),
+        ),
+      );
+
+      assert.deepEqual(expandWorktreeMaterializationFull.mock.calls[0]?.[0], worktreePath);
+      assert.deepEqual(expandWorktreeMaterializationFull.mock.calls[0]?.[1], "operator-recovery");
+      assert.deepEqual(response.materialization, {
+        ...expandedMaterialization,
+        reason: `operator-recovery:${worktreePath}`,
+      });
+      const materializationCommand = dispatchedCommands[0];
+      assertTrue(materializationCommand?.type === "thread.materialization.set");
+      if (materializationCommand?.type === "thread.materialization.set") {
+        assert.equal(materializationCommand.threadId, threadId);
+        assert.deepEqual(materializationCommand.materialization, response.materialization);
+      }
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.materialization.set"],
+      );
+      assert.deepEqual(refreshStatus.mock.calls[0]?.[0], worktreePath);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect(
     "bootstraps first-send worktree turns on the server before dispatching turn start",
     () =>
@@ -8917,6 +9042,26 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             }),
         );
         const fetchedOriginCommit = "0123456789abcdef0123456789abcdef01234567";
+        const materializationRequest = {
+          requestedProfileId: "governance-review",
+          expectedContractSha256: "a".repeat(64),
+          taskId: "OC-1",
+          taskSlug: "task",
+          taskCardPath: "ops/stef-task/task/stef-task.json",
+          scopePaths: ["docs/spec.md"],
+          taskClasses: ["source-task"],
+        } as const;
+        const materializationState = {
+          ...FULL_WORKTREE_MATERIALIZATION_STATE,
+          ...materializationRequest,
+          effectiveProfileId: "governance-review",
+          mode: "sparse" as const,
+          reason: null,
+          contractSha256: "a".repeat(64),
+          manifestSha256: "b".repeat(64),
+          conePaths: ["docs"],
+          requiredPaths: ["docs/spec.md"],
+        };
         const resolveRemoteTrackingCommit = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["resolveRemoteTrackingCommit"]>[0]) =>
             Effect.sync(() => {
@@ -8936,8 +9081,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   refName: "t3code/bootstrap-refName",
                   path: "/tmp/bootstrap-worktree",
                 },
+                materialization: materializationState,
               };
             }),
+        );
+        const verifyWorktreeMaterialization = vi.fn((cwd: string) =>
+          Effect.sync(() => {
+            bootstrapGitOperations.push("verify-materialization");
+            assert.equal(cwd, "/tmp/bootstrap-worktree");
+            return materializationState;
+          }),
         );
         const runForThread = vi.fn(
           (
@@ -8962,6 +9115,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               remoteBranchExists,
               resolveRemoteTrackingCommit,
               createWorktree,
+              verifyWorktreeMaterialization,
             },
             vcsStatusBroadcaster: {
               refreshStatus,
@@ -8970,6 +9124,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               dispatch: (command) =>
                 Effect.sync(() => {
                   dispatchedCommands.push(command);
+                  if (command.type === "thread.materialization.set") {
+                    bootstrapGitOperations.push("persist-materialization");
+                  }
                   return { sequence: dispatchedCommands.length };
                 }),
               readEvents: () => Stream.empty,
@@ -9013,6 +9170,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   baseBranch: "main",
                   branch: "t3code/bootstrap-refName",
                   startFromOrigin: true,
+                  materialization: materializationRequest,
                 },
                 runSetupScript: true,
               },
@@ -9021,12 +9179,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           ),
         );
 
-        assert.equal(response.sequence, 5);
+        assert.equal(response.sequence, 6);
         assert.deepEqual(
           dispatchedCommands.map((command) => command.type),
           [
             "thread.create",
             "thread.meta.update",
+            "thread.materialization.set",
             "thread.activity.append",
             "thread.activity.append",
             "thread.turn.start",
@@ -9038,6 +9197,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           newRefName: "t3code/bootstrap-refName",
           baseRefName: "main",
           path: null,
+          materialization: materializationRequest,
         });
         assert.deepEqual(fetchRemote.mock.calls[0]?.[0], {
           cwd: "/tmp/project",
@@ -9059,6 +9219,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           "remote-branch-exists",
           "resolve-remote-commit",
           "create-worktree",
+          "verify-materialization",
+          "persist-materialization",
         ]);
         assert.deepEqual(runForThread.mock.calls[0]?.[0], {
           threadId: ThreadId.make("thread-bootstrap"),
@@ -9076,12 +9238,130 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           setupActivities.map((command) => command.activity.kind),
           ["setup-script.requested", "setup-script.started"],
         );
-        const finalCommand = dispatchedCommands[4];
+        const materializationCommand = dispatchedCommands[2];
+        assertTrue(materializationCommand?.type === "thread.materialization.set");
+        if (materializationCommand?.type === "thread.materialization.set") {
+          assert.deepEqual(materializationCommand.materialization, materializationState);
+        }
+        const finalCommand = dispatchedCommands[5];
         assertTrue(finalCommand?.type === "thread.turn.start");
         if (finalCommand?.type === "thread.turn.start") {
           assert.equal(finalCommand.bootstrap, undefined);
         }
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("fails bootstrap closed when verified materialization differs from creation", () =>
+    Effect.gen(function* () {
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const materializationRequest = {
+        requestedProfileId: "governance-review",
+        expectedContractSha256: "a".repeat(64),
+        taskId: "OC-1",
+        taskSlug: "task",
+        taskCardPath: "ops/stef-task/task/stef-task.json",
+        scopePaths: ["docs/spec.md"],
+      } as const;
+      const createdMaterialization = {
+        ...FULL_WORKTREE_MATERIALIZATION_STATE,
+        ...materializationRequest,
+        effectiveProfileId: "governance-review",
+        mode: "sparse" as const,
+        reason: null,
+        contractSha256: "a".repeat(64),
+        manifestSha256: "b".repeat(64),
+        conePaths: ["docs"],
+        requiredPaths: ["docs/spec.md"],
+      };
+      const verifiedMaterialization = {
+        ...createdMaterialization,
+        manifestSha256: "c".repeat(64),
+      };
+      const createWorktree = vi.fn(
+        (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
+          Effect.succeed({
+            worktree: {
+              refName: "t3code/bootstrap-mismatch",
+              path: "/tmp/bootstrap-mismatch-worktree",
+            },
+            materialization: createdMaterialization,
+          }),
+      );
+      const verifyWorktreeMaterialization = vi.fn((_: string) =>
+        Effect.succeed(verifiedMaterialization),
+      );
+
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: { createWorktree, verifyWorktreeMaterialization },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: dispatchedCommands.length };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-bootstrap-materialization-mismatch"),
+            threadId: ThreadId.make("thread-bootstrap-materialization-mismatch"),
+            message: {
+              messageId: MessageId.make("msg-bootstrap-materialization-mismatch"),
+              role: "user",
+              text: "hello",
+              attachments: [],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId: defaultProjectId,
+                title: "Bootstrap Thread",
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt,
+              },
+              prepareWorktree: {
+                projectCwd: "/tmp/project",
+                baseBranch: "main",
+                branch: "t3code/bootstrap-mismatch",
+                materialization: materializationRequest,
+              },
+              runSetupScript: false,
+            },
+            createdAt,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "does not match its persisted identity");
+      assert.strictEqual(result.failure.bootstrapThreadDisposition, "deleted");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.create", "thread.meta.update", "thread.delete"],
+      );
+      assert.equal(verifyWorktreeMaterialization.mock.calls.length, 1);
+      assert.isFalse(
+        dispatchedCommands.some(
+          (command) =>
+            command.type === "thread.materialization.set" || command.type === "thread.turn.start",
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect.each([

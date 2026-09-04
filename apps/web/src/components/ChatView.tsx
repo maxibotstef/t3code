@@ -24,6 +24,7 @@ import {
   resolveEnvironmentMachineKind,
   RuntimeMode,
   TerminalOpenInput,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
 } from "@t3tools/contracts";
 import { type EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
 import { wasBootstrapThreadDeleted } from "@t3tools/client-runtime/errors";
@@ -385,6 +386,9 @@ import {
   resolveDraftHeroState,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  buildUiWorktreeMaterializationRequest,
+  parseWorktreeMaterializationUiContract,
+  worktreeMaterializationPresentation,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   shouldWriteThreadErrorToCurrentServerThread,
@@ -1383,6 +1387,10 @@ function ChatViewContent(props: ChatViewProps) {
     reportFailure: false,
   });
   const switchGitRef = useAtomCommand(vcsEnvironment.switchRef, { reportFailure: false });
+  const expandWorktreeMaterialization = useAtomCommand(
+    vcsEnvironment.expandWorktreeMaterialization,
+    { reportFailure: false },
+  );
   const setThreadRuntimeMode = useAtomCommand(threadEnvironment.setRuntimeMode, {
     reportFailure: false,
   });
@@ -4935,6 +4943,146 @@ function ChatViewContent(props: ChatViewProps) {
     requestedEnvMode: envMode,
     isGitRepo,
   });
+  const [requestedMaterializationProfileId, setRequestedMaterializationProfileId] =
+    useState("full");
+  const [materializationTaskCardPath, setMaterializationTaskCardPath] = useState("");
+  const [materializationExpandPending, setMaterializationExpandPending] = useState(false);
+  useEffect(() => {
+    setRequestedMaterializationProfileId("full");
+    setMaterializationTaskCardPath("");
+    setMaterializationExpandPending(false);
+  }, [activeProject?.id, activeThread?.id]);
+  const materializationContractQuery = useEnvironmentQuery(
+    activeProject && envMode === "worktree"
+      ? projectEnvironment.readFile({
+          environmentId,
+          input: {
+            cwd: activeProject.workspaceRoot,
+            relativePath: "config/worktree-materialization-profiles.json",
+          },
+        })
+      : null,
+  );
+  const materializationTaskCardQuery = useEnvironmentQuery(
+    activeProject && envMode === "worktree" && materializationTaskCardPath.trim().length > 0
+      ? projectEnvironment.readFile({
+          environmentId,
+          input: {
+            cwd: activeProject.workspaceRoot,
+            relativePath: materializationTaskCardPath.trim(),
+          },
+        })
+      : null,
+  );
+  const materializationContract = useMemo(
+    () =>
+      materializationContractQuery.data?.truncated === false
+        ? parseWorktreeMaterializationUiContract(materializationContractQuery.data.contents)
+        : null,
+    [materializationContractQuery.data],
+  );
+  const [materializationContractSha256, setMaterializationContractSha256] = useState<string | null>(
+    null,
+  );
+  useEffect(() => {
+    let cancelled = false;
+    const source = materializationContractQuery.data;
+    if (!source || source.truncated || materializationContract === null) {
+      setMaterializationContractSha256(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    const bytes = new TextEncoder().encode(source.contents);
+    if (bytes.byteLength !== source.byteLength) {
+      setMaterializationContractSha256(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) {
+      setMaterializationContractSha256(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void subtle.digest("SHA-256", bytes).then(
+      (digest) => {
+        if (cancelled) return;
+        setMaterializationContractSha256(
+          [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join(""),
+        );
+      },
+      () => {
+        if (!cancelled) setMaterializationContractSha256(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [materializationContract, materializationContractQuery.data]);
+  useEffect(() => {
+    if (
+      requestedMaterializationProfileId !== "full" &&
+      !materializationContract?.profiles.some(
+        (profile) => profile.id === requestedMaterializationProfileId,
+      )
+    ) {
+      setRequestedMaterializationProfileId("full");
+    }
+  }, [materializationContract, requestedMaterializationProfileId]);
+  const requestedWorktreeMaterialization = useMemo(() => {
+    return buildUiWorktreeMaterializationRequest({
+      requestedProfileId: requestedMaterializationProfileId,
+      contractSha256: materializationContractSha256,
+      taskCardContents: materializationTaskCardQuery.data?.contents ?? null,
+      taskCardPath: materializationTaskCardPath,
+    });
+  }, [
+    materializationContractSha256,
+    materializationTaskCardPath,
+    materializationTaskCardQuery.data?.contents,
+    requestedMaterializationProfileId,
+  ]);
+  const activeMaterializationPresentation = useMemo(
+    () =>
+      activeThread
+        ? worktreeMaterializationPresentation(
+            activeThread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE,
+          )
+        : null,
+    [activeThread],
+  );
+  const handleExpandWorktreeMaterialization = useCallback(async () => {
+    if (!activeThread?.worktreePath || materializationExpandPending) return;
+    setMaterializationExpandPending(true);
+    try {
+      const result = await expandWorktreeMaterialization({
+        environmentId,
+        input: {
+          cwd: activeThread.worktreePath,
+          threadId: activeThread.id,
+          reason: "user-expand-full",
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not expand worktree",
+            description: chatActionErrorMessage(squashAtomCommandFailure(result)),
+          }),
+        );
+      } else if (result._tag === "Success") {
+        toastManager.add(
+          stackedThreadToast({ type: "success", title: "Worktree expanded to full" }),
+        );
+      }
+    } finally {
+      setMaterializationExpandPending(false);
+    }
+  }, [activeThread, environmentId, expandWorktreeMaterialization, materializationExpandPending]);
   const localCheckoutBranchMismatch = useMemo(
     () =>
       isServerThread
@@ -6658,6 +6806,9 @@ function ChatViewContent(props: ChatViewProps) {
                       baseBranch: baseBranchForWorktree,
                       branch: buildTemporaryWorktreeBranchName(randomHex),
                       ...(startFromOrigin ? { startFromOrigin: true } : {}),
+                      ...(requestedWorktreeMaterialization
+                        ? { materialization: requestedWorktreeMaterialization }
+                        : {}),
                     },
                     runSetupScript: true,
                   }
@@ -7997,6 +8148,85 @@ function ChatViewContent(props: ChatViewProps) {
                         >
                           {mountComposerContextStrip && (
                             <div className="pointer-events-auto">
+                              {envMode === "worktree" &&
+                              (isLocalDraftThread || canOverrideServerThreadEnvMode) &&
+                              materializationContract &&
+                              materializationContractSha256 ? (
+                                <div className="flex flex-wrap items-center gap-2 border-t border-border/60 px-3 py-2 text-xs">
+                                  <label className="flex items-center gap-2">
+                                    <span className="text-muted-foreground">Worktree files</span>
+                                    <select
+                                      aria-label="Worktree materialization profile"
+                                      className="rounded border border-border bg-background px-2 py-1"
+                                      value={requestedMaterializationProfileId}
+                                      onChange={(event) =>
+                                        setRequestedMaterializationProfileId(event.target.value)
+                                      }
+                                    >
+                                      {materializationContract.profiles
+                                        .filter(
+                                          (profile) =>
+                                            profile.id === "full" || profile.mode === "sparse",
+                                        )
+                                        .map((profile) => (
+                                          <option key={profile.id} value={profile.id}>
+                                            {profile.id}
+                                          </option>
+                                        ))}
+                                    </select>
+                                  </label>
+                                  {requestedMaterializationProfileId !== "full" ? (
+                                    <label className="flex min-w-64 flex-1 items-center gap-2">
+                                      <span className="text-muted-foreground">Task card</span>
+                                      <input
+                                        aria-label="Repository-relative task card path"
+                                        className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1"
+                                        placeholder="ops/stef-task/.../stef-task.json"
+                                        value={materializationTaskCardPath}
+                                        onChange={(event) =>
+                                          setMaterializationTaskCardPath(event.target.value)
+                                        }
+                                      />
+                                    </label>
+                                  ) : null}
+                                  {requestedMaterializationProfileId !== "full" &&
+                                  requestedWorktreeMaterialization?.taskClasses?.includes(
+                                    "unclassified",
+                                  ) ? (
+                                    <span className="text-amber-600 dark:text-amber-400">
+                                      A missing or mismatched task card will safely materialize
+                                      full.
+                                    </span>
+                                  ) : null}
+                                </div>
+                              ) : null}
+                              {isServerThread &&
+                              activeThread.worktreePath &&
+                              activeMaterializationPresentation ? (
+                                <div className="flex items-center justify-between gap-3 border-t border-border/60 px-3 py-2 text-xs">
+                                  <span
+                                    className={
+                                      activeMaterializationPresentation.fellBack
+                                        ? "text-amber-600 dark:text-amber-400"
+                                        : "text-muted-foreground"
+                                    }
+                                  >
+                                    {activeMaterializationPresentation.label}
+                                  </span>
+                                  {activeMaterializationPresentation.canExpand ? (
+                                    <button
+                                      type="button"
+                                      disabled={materializationExpandPending}
+                                      className="rounded border border-border bg-background px-2 py-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+                                      onClick={() => void handleExpandWorktreeMaterialization()}
+                                    >
+                                      {materializationExpandPending
+                                        ? "Expanding…"
+                                        : "Expand to full"}
+                                    </button>
+                                  ) : null}
+                                </div>
+                              ) : null}
                               <BranchToolbar
                                 environmentId={activeThread.environmentId}
                                 threadId={activeThread.id}

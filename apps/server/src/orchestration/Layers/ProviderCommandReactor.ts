@@ -9,6 +9,8 @@ import {
   type OrchestrationSession,
   ThreadId,
   type ProviderSession,
+  type OrchestrationThread,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
   type RuntimeMode,
   type TurnId,
 } from "@t3tools/contracts";
@@ -483,13 +485,15 @@ const make = Effect.gen(function* () {
    * Recreates a thread's worktree from its branch when the directory has
    * disappeared. Provider sessions resume into the persisted cwd, so a missing
    * worktree makes every later turn fail as a bogus "session not found".
-   * Best-effort: on failure the turn proceeds and reports the real error.
+   * Recreation is best-effort; the mandatory verifier blocks the turn if the
+   * restored path is absent or does not match the persisted materialization.
    */
   const ensureThreadWorktree = Effect.fnUntraced(function* (thread: {
     readonly id: ThreadId;
     readonly projectId: ProjectId;
     readonly branch: string | null;
     readonly worktreePath: string | null;
+    readonly materialization?: OrchestrationThread["materialization"];
   }) {
     const { worktreePath, branch } = thread;
     if (!worktreePath || !branch) {
@@ -511,8 +515,38 @@ const make = Effect.gen(function* () {
     });
     // A directory deleted without `git worktree remove` leaves an admin entry
     // that makes `git worktree add` refuse the path; prune clears it.
+    const persistedMaterialization = thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE;
+    const taskCardPath = persistedMaterialization.taskCardPath ?? null;
+    const sparseRehydration =
+      persistedMaterialization.effectiveProfileId !== "full" &&
+      persistedMaterialization.expectedContractSha256 &&
+      persistedMaterialization.taskId &&
+      persistedMaterialization.taskSlug &&
+      taskCardPath
+        ? {
+            requestedProfileId: persistedMaterialization.effectiveProfileId,
+            expectedContractSha256: persistedMaterialization.expectedContractSha256,
+            taskId: persistedMaterialization.taskId,
+            taskSlug: persistedMaterialization.taskSlug,
+            taskCardPath,
+            scopePaths: persistedMaterialization.scopePaths ?? [],
+            ...(persistedMaterialization.taskClasses
+              ? { taskClasses: persistedMaterialization.taskClasses }
+              : {}),
+            ...(persistedMaterialization.includeResearchTask === true
+              ? { includeResearchTask: true }
+              : {}),
+          }
+        : undefined;
     yield* gitWorkflow.pruneWorktrees({ cwd }).pipe(
-      Effect.andThen(gitWorkflow.createWorktree({ cwd, refName: branch, path: worktreePath })),
+      Effect.andThen(
+        gitWorkflow.createWorktree({
+          cwd,
+          refName: branch,
+          path: worktreePath,
+          ...(sparseRehydration ? { materialization: sparseRehydration } : {}),
+        }),
+      ),
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.failCause(cause)
@@ -1284,6 +1318,28 @@ const make = Effect.gen(function* () {
     }
 
     yield* ensureThreadWorktree(thread);
+
+    const materializationReady = yield* Effect.gen(function* () {
+      if (!thread.worktreePath) return true;
+      const materialization = yield* gitWorkflow.verifyWorktreeMaterialization(thread.worktreePath);
+      if (
+        !Equal.equals(
+          materialization,
+          thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE,
+        )
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabelFromInstanceHint({
+            instanceId: String(thread.modelSelection.instanceId),
+          }),
+          method: "thread.turn.start",
+          detail:
+            "Persisted thread materialization does not match the worktree. Preserve changes in an ordinary named commit or operator-approved external copy, reach a clean state without automated stash/reset/clean/removal, run expand-full, then reverify.",
+        });
+      }
+      return true;
+    }).pipe(Effect.catchCause((cause) => recoverTurnStartFailure(cause).pipe(Effect.as(false))));
+    if (!materializationReady) return;
 
     const isCompactCommand = isCompactCommandMessage(message);
     const nonCompactUserMessageCount = thread.messages.filter(

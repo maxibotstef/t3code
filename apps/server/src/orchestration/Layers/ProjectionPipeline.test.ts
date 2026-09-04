@@ -476,6 +476,114 @@ it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-atta
   },
 );
 
+it.layer(BaseTestLayer)("OrchestrationProjectionPipeline materialization", (it) => {
+  it.effect("persists server-authored requested and effective identities", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-01-01T00:00:00.000Z";
+      const events: Array<Parameters<typeof eventStore.append>[0]> = [
+        {
+          type: "project.created",
+          eventId: EventId.make("evt-materialization-project"),
+          aggregateKind: "project",
+          aggregateId: ProjectId.make("project-materialization"),
+          occurredAt: now,
+          commandId: CommandId.make("cmd-materialization-project"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-materialization-project"),
+          metadata: {},
+          payload: {
+            projectId: ProjectId.make("project-materialization"),
+            title: "Project",
+            workspaceRoot: "/tmp/project-materialization",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          type: "thread.created",
+          eventId: EventId.make("evt-materialization-thread"),
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-materialization"),
+          occurredAt: now,
+          commandId: CommandId.make("cmd-materialization-thread"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-materialization-thread"),
+          metadata: {},
+          payload: {
+            threadId: ThreadId.make("thread-materialization"),
+            projectId: ProjectId.make("project-materialization"),
+            title: "Thread",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          type: "thread.materialization-set",
+          eventId: EventId.make("evt-materialization-set"),
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-materialization"),
+          occurredAt: now,
+          commandId: CommandId.make("cmd-materialization-set"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-materialization-set"),
+          metadata: {},
+          payload: {
+            threadId: ThreadId.make("thread-materialization"),
+            materialization: {
+              requestedProfileId: "governance-review",
+              effectiveProfileId: "full",
+              mode: "full",
+              reason: "required-paths-missing",
+              expectedContractSha256: "a".repeat(64),
+              contractSha256: "a".repeat(64),
+              manifestSha256: "b".repeat(64),
+              conePaths: ["docs"],
+              requiredPaths: ["docs/spec.md"],
+              taskId: "OC-1",
+              taskSlug: "task",
+            },
+            updatedAt: now,
+          },
+        },
+      ];
+      yield* Effect.forEach(events, eventStore.append, { concurrency: 1 });
+      yield* projectionPipeline.bootstrap;
+      const rows = yield* sql<{
+        readonly requested: string;
+        readonly effective: string;
+        readonly reason: string;
+      }>`
+        SELECT
+          materialization_requested_profile_id AS requested,
+          materialization_effective_profile_id AS effective,
+          materialization_reason AS reason
+        FROM projection_threads
+        WHERE thread_id = 'thread-materialization'
+      `;
+      assert.deepEqual(rows, [
+        {
+          requested: "governance-review",
+          effective: "full",
+          reason: "required-paths-missing",
+        },
+      ]);
+    }),
+  );
+});
+
 it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   it.effect(
     "passes explicit empty attachment arrays through the projection pipeline to clear attachments",

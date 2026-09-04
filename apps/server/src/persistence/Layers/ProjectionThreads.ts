@@ -14,12 +14,18 @@ import {
   ProjectionThreadRepository,
   type ProjectionThreadRepositoryShape,
 } from "../Services/ProjectionThreads.ts";
-import { ModelSelection, ThreadLinkedPullRequest } from "@t3tools/contracts";
+import {
+  ModelSelection,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
+  ThreadLinkedPullRequest,
+  VcsWorktreeMaterializationState,
+} from "@t3tools/contracts";
 
 const ProjectionThreadDbRow = ProjectionThread.mapFields(
   Struct.assign({
     modelSelection: Schema.fromJsonString(ModelSelection),
     linkedPullRequest: Schema.NullOr(Schema.fromJsonString(ThreadLinkedPullRequest)),
+    materialization: Schema.fromJsonString(VcsWorktreeMaterializationState),
   }),
 );
 type ProjectionThreadDbRow = typeof ProjectionThreadDbRow.Type;
@@ -29,8 +35,9 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
 
   const upsertProjectionThreadRow = SqlSchema.void({
     Request: ProjectionThread,
-    execute: (row) =>
-      sql`
+    execute: (row) => {
+      const materialization = row.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE;
+      return sql`
         INSERT INTO projection_threads (
           thread_id,
           project_id,
@@ -40,6 +47,14 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           interaction_mode,
           branch,
           worktree_path,
+          materialization_json,
+          materialization_requested_profile_id,
+          materialization_effective_profile_id,
+          materialization_mode,
+          materialization_expected_contract_sha256,
+          materialization_contract_sha256,
+          materialization_manifest_sha256,
+          materialization_reason,
           linked_pull_request_json,
           latest_turn_id,
           created_at,
@@ -69,6 +84,14 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           ${row.interactionMode},
           ${row.branch},
           ${row.worktreePath},
+          ${JSON.stringify(materialization)},
+          ${materialization.requestedProfileId},
+          ${materialization.effectiveProfileId},
+          ${materialization.mode},
+          ${materialization.expectedContractSha256},
+          ${materialization.contractSha256},
+          ${materialization.manifestSha256},
+          ${materialization.reason},
           ${row.linkedPullRequest === undefined || row.linkedPullRequest === null ? null : JSON.stringify(row.linkedPullRequest)},
           ${row.latestTurnId},
           ${row.createdAt},
@@ -98,6 +121,14 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           interaction_mode = excluded.interaction_mode,
           branch = excluded.branch,
           worktree_path = excluded.worktree_path,
+          materialization_json = excluded.materialization_json,
+          materialization_requested_profile_id = excluded.materialization_requested_profile_id,
+          materialization_effective_profile_id = excluded.materialization_effective_profile_id,
+          materialization_mode = excluded.materialization_mode,
+          materialization_expected_contract_sha256 = excluded.materialization_expected_contract_sha256,
+          materialization_contract_sha256 = excluded.materialization_contract_sha256,
+          materialization_manifest_sha256 = excluded.materialization_manifest_sha256,
+          materialization_reason = excluded.materialization_reason,
           linked_pull_request_json = excluded.linked_pull_request_json,
           latest_turn_id = excluded.latest_turn_id,
           created_at = excluded.created_at,
@@ -117,7 +148,8 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           pending_user_input_count = excluded.pending_user_input_count,
           has_actionable_proposed_plan = excluded.has_actionable_proposed_plan,
           deleted_at = excluded.deleted_at
-      `,
+      `;
+    },
   });
 
   const getProjectionThreadRow = SqlSchema.findOneOption({
@@ -134,6 +166,7 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           interaction_mode AS "interactionMode",
           branch,
           worktree_path AS "worktreePath",
+          materialization_json AS "materialization",
           linked_pull_request_json AS "linkedPullRequest",
           latest_turn_id AS "latestTurnId",
           created_at AS "createdAt",
@@ -172,6 +205,7 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           interaction_mode AS "interactionMode",
           branch,
           worktree_path AS "worktreePath",
+          materialization_json AS "materialization",
           linked_pull_request_json AS "linkedPullRequest",
           latest_turn_id AS "latestTurnId",
           created_at AS "createdAt",

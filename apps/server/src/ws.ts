@@ -3,6 +3,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -1134,6 +1135,9 @@ const makeWsRpcLayer = (
                 newRefName: bootstrap.prepareWorktree.branch,
                 baseRefName: bootstrap.prepareWorktree.baseBranch,
                 path: null,
+                ...(bootstrap.prepareWorktree.materialization
+                  ? { materialization: bootstrap.prepareWorktree.materialization }
+                  : {}),
               });
               targetWorktreePath = worktree.worktree.path;
               yield* dispatchFromClient({
@@ -1143,6 +1147,24 @@ const makeWsRpcLayer = (
                 branch: worktree.worktree.refName,
                 worktreePath: targetWorktreePath,
               });
+              const materialization = worktree.materialization;
+              if (materialization) {
+                const verifiedMaterialization =
+                  yield* gitWorkflow.verifyWorktreeMaterialization(targetWorktreePath);
+                if (!Equal.equals(verifiedMaterialization, materialization)) {
+                  return yield* new OrchestrationDispatchCommandError({
+                    message:
+                      "Created worktree materialization does not match its persisted identity.",
+                  });
+                }
+                yield* dispatchFromClient({
+                  type: "thread.materialization.set",
+                  commandId: yield* serverCommandId("bootstrap-thread-materialization-set"),
+                  threadId: command.threadId,
+                  materialization,
+                  createdAt: finalTurnStartCommand.createdAt,
+                });
+              }
               yield* refreshGitStatus(targetWorktreePath);
             }
 
@@ -2403,6 +2425,55 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.vcsCreateWorktree,
             gitWorkflow.createWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            { "rpc.aggregate": "vcs" },
+          ),
+        [WS_METHODS.vcsExpandWorktreeMaterialization]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.vcsExpandWorktreeMaterialization,
+            Effect.gen(function* () {
+              const thread = Option.getOrUndefined(
+                yield* projectionSnapshotQuery.getThreadShellById(input.threadId).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationDispatchCommandError({
+                        message: "Failed to read thread state for expand-full.",
+                        cause,
+                      }),
+                  ),
+                ),
+              );
+              if (!thread || thread.worktreePath !== input.cwd) {
+                return yield* new OrchestrationDispatchCommandError({
+                  message:
+                    "expand-full requires the exact persisted worktree path for the named thread.",
+                });
+              }
+              if (thread.session?.status === "starting" || thread.session?.status === "running") {
+                return yield* new OrchestrationDispatchCommandError({
+                  message: "expand-full is unavailable while the thread session is active.",
+                });
+              }
+              const materialization = yield* gitWorkflow.expandWorktreeMaterializationFull(
+                input.cwd,
+                input.reason ?? "operator-expand-full",
+              );
+              yield* dispatchFromClient({
+                type: "thread.materialization.set",
+                commandId: yield* serverCommandId("thread-materialization-expand-full"),
+                threadId: input.threadId,
+                materialization,
+                createdAt: yield* nowIso,
+              }).pipe(
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(
+                    cause,
+                    "Failed to persist expanded worktree materialization",
+                  ),
+                ),
+              );
+              yield* refreshGitStatus(input.cwd);
+              return { materialization };
+            }),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.vcsRemoveWorktree]: (input) =>

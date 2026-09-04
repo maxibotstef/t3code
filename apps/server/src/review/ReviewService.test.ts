@@ -1,10 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 
+import { FULL_WORKTREE_MATERIALIZATION_STATE, GitCommandError } from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -14,6 +16,8 @@ function makeLayer(input: {
   readonly workspaceRoot: string;
   readonly baseDir: string;
   readonly detectCalls?: Array<{ readonly cwd: string }>;
+  readonly detectResult?: VcsDriverRegistry.VcsDriverHandle | null;
+  readonly git?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
 }) {
   return ReviewService.layer.pipe(
     Layer.provide(
@@ -23,11 +27,11 @@ function makeLayer(input: {
         detect: (request) =>
           Effect.sync(() => {
             input.detectCalls?.push({ cwd: request.cwd });
-            return null;
+            return input.detectResult ?? null;
           }),
       }),
     ),
-    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ ...input.git })),
     Layer.provide(ServerConfig.layerTest(input.workspaceRoot, input.baseDir)),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -105,6 +109,81 @@ describe("ReviewService", () => {
       assert.strictEqual(result.cwd, workspaceRoot);
       assert.deepStrictEqual(result.sources, []);
       assert.deepStrictEqual(detectCalls, [{ cwd: workspaceRoot }]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("verifies a legacy full Git checkout before review and preserves normal output", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workspaceRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-workspace-" });
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-base-" });
+      const verifyCalls: Array<string> = [];
+      const result = yield* Effect.gen(function* () {
+        const review = yield* ReviewService.ReviewService;
+        return yield* review.getDiffPreview({ cwd: workspaceRoot });
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            workspaceRoot,
+            baseDir,
+            detectResult: {
+              kind: "git",
+              repository: {} as never,
+              driver: {} as never,
+            },
+            git: {
+              verifyWorktreeMaterialization: (cwd) =>
+                Effect.sync(() => {
+                  verifyCalls.push(cwd);
+                  return FULL_WORKTREE_MATERIALIZATION_STATE;
+                }),
+              getReviewDiffPreview: (input) =>
+                Effect.gen(function* () {
+                  return { cwd: input.cwd, generatedAt: yield* DateTime.now, sources: [] };
+                }),
+            },
+          }),
+        ),
+      );
+      assert.deepStrictEqual(verifyCalls, [workspaceRoot]);
+      assert.strictEqual(result.cwd, workspaceRoot);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("blocks review when Git materialization verification fails", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workspaceRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-workspace-" });
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-base-" });
+      const error = yield* Effect.gen(function* () {
+        const review = yield* ReviewService.ReviewService;
+        return yield* review.getDiffPreview({ cwd: workspaceRoot }).pipe(Effect.flip);
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            workspaceRoot,
+            baseDir,
+            detectResult: {
+              kind: "git",
+              repository: {} as never,
+              driver: {} as never,
+            },
+            git: {
+              verifyWorktreeMaterialization: () =>
+                Effect.fail(
+                  new GitCommandError({
+                    operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                    command: "git",
+                    cwd: workspaceRoot,
+                    detail: "required paths missing",
+                  }),
+                ),
+            },
+          }),
+        ),
+      );
+      assert.strictEqual(error._tag, "GitCommandError");
+      assert.match(error.message, /required paths missing/);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

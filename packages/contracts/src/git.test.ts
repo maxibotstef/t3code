@@ -44,6 +44,43 @@ describe("VcsCreateWorktreeInput", () => {
 
     expect(parsed.baseRefName).toBe("origin/main");
   });
+
+  it("accepts an explicit hash-bound materialization request", () => {
+    const parsed = decodeCreateWorktreeInput({
+      cwd: "/repo",
+      refName: "main",
+      path: "/tmp/worktree",
+      materialization: {
+        requestedProfileId: "governance-review",
+        expectedContractSha256: "a".repeat(64),
+        taskId: "OC-1",
+        taskSlug: "governance-task",
+        taskCardPath: "ops/stef-task/governance-task/stef-task.json",
+        scopePaths: ["docs/spec.md"],
+      },
+    });
+
+    expect(parsed.materialization?.requestedProfileId).toBe("governance-review");
+    expect(parsed.materialization?.expectedContractSha256).toBe("a".repeat(64));
+  });
+
+  it("rejects a non-SHA contract identity", () => {
+    expect(() =>
+      decodeCreateWorktreeInput({
+        cwd: "/repo",
+        refName: "main",
+        path: "/tmp/worktree",
+        materialization: {
+          requestedProfileId: "governance-review",
+          expectedContractSha256: "not-a-sha",
+          taskId: "OC-1",
+          taskSlug: "governance-task",
+          taskCardPath: "ops/stef-task/governance-task/stef-task.json",
+          scopePaths: ["docs/spec.md"],
+        },
+      }),
+    ).toThrow();
+  });
 });
 
 describe("GitPreparePullRequestThreadInput", () => {

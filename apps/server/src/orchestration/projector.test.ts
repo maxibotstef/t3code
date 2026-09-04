@@ -5,6 +5,7 @@ import {
   ProviderDriverKind,
   ThreadId,
   type OrchestrationEvent,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
@@ -85,6 +86,7 @@ describe("orchestration projector", () => {
         interactionMode: "default",
         branch: null,
         worktreePath: null,
+        materialization: FULL_WORKTREE_MATERIALIZATION_STATE,
         latestTurn: null,
         createdAt: now,
         updatedAt: now,
@@ -102,6 +104,67 @@ describe("orchestration projector", () => {
         session: null,
       },
     ]);
+  });
+
+  it("applies server-owned thread materialization events", async () => {
+    const now = "2026-01-01T00:00:00.000Z";
+    const created = await Effect.runPromise(
+      projectEvent(
+        createEmptyReadModel(now),
+        makeEvent({
+          sequence: 1,
+          type: "thread.created",
+          aggregateKind: "thread",
+          aggregateId: "thread-materialized",
+          occurredAt: now,
+          commandId: "cmd-create",
+          payload: {
+            threadId: "thread-materialized",
+            projectId: "project-1",
+            title: "demo",
+            modelSelection: { provider: "codex", model: "gpt-5-codex" },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        }),
+      ),
+    );
+    const sparse = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      effectiveProfileId: "governance-review",
+      mode: "sparse" as const,
+      reason: null,
+      expectedContractSha256: "a".repeat(64),
+      contractSha256: "a".repeat(64),
+      manifestSha256: "b".repeat(64),
+      conePaths: ["docs"],
+      requiredPaths: ["docs/spec.md"],
+      taskId: "OC-1",
+      taskSlug: "demo",
+    };
+    const next = await Effect.runPromise(
+      projectEvent(
+        created,
+        makeEvent({
+          sequence: 2,
+          type: "thread.materialization-set",
+          aggregateKind: "thread",
+          aggregateId: "thread-materialized",
+          occurredAt: now,
+          commandId: "cmd-materialization",
+          payload: {
+            threadId: "thread-materialized",
+            materialization: sparse,
+            updatedAt: now,
+          },
+        }),
+      ),
+    );
+    expect(next.threads[0]?.materialization).toEqual(sparse);
   });
 
   it("fails when event payload cannot be decoded by runtime schema", async () => {

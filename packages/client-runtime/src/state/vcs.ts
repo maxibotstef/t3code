@@ -311,6 +311,13 @@ export function createVcsEnvironmentAtoms<R, E>(
       concurrency: vcsCommandConcurrency,
       onSettled: invalidateRefs,
     }),
+    expandWorktreeMaterialization: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:vcs:expand-worktree-materialization",
+      tag: WS_METHODS.vcsExpandWorktreeMaterialization,
+      scheduler: vcsCommandScheduler,
+      concurrency: vcsCommandConcurrency,
+      onSettled: invalidateRefs,
+    }),
     removeWorktree: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:remove-worktree",
       tag: WS_METHODS.vcsRemoveWorktree,

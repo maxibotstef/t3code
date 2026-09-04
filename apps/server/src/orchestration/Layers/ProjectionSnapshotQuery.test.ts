@@ -6,6 +6,7 @@ import {
   ThreadId,
   TurnId,
   ProviderInstanceId,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -309,6 +310,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           runtimeMode: "full-access",
           branch: null,
           worktreePath: null,
+          materialization: FULL_WORKTREE_MATERIALIZATION_STATE,
           linkedPullRequest: {
             projectId: asProjectId("project-1"),
             repository: "pingdotgg/t3code",
@@ -437,6 +439,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           runtimeMode: "full-access",
           branch: null,
           worktreePath: null,
+          materialization: FULL_WORKTREE_MATERIALIZATION_STATE,
           linkedPullRequest: {
             projectId: asProjectId("project-1"),
             repository: "pingdotgg/t3code",
