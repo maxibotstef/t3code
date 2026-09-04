@@ -531,8 +531,9 @@ export const persistActivatedServerRuntimeFiles = Effect.fn("server.persistActiv
     }
 
     // Runtime state is the discovery commit marker. Publish it after the
-    // credential so a concurrent Desktop launch never observes a live,
-    // attach-capable owner before its attach file is ready.
+    // best-effort credential write so the attach file is ready first when
+    // possible; a missing or stale attach file reaches discovery's
+    // attach-credential-unavailable refusal and never permits a second spawn.
     yield* persistServerRuntimeState({
       path: input.config.serverRuntimeStatePath,
       state: input.state,

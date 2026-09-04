@@ -11,20 +11,25 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
+import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopBackendAttachment from "../backend/DesktopBackendAttachment.ts";
 import * as DesktopBackendManager from "../backend/DesktopBackendManager.ts";
 import { discoverDesktopBackend } from "../backend/DesktopBackendDiscovery.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
-import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopServerExposure from "../backend/DesktopServerExposure.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
+import * as ElectronWindow from "../electron/ElectronWindow.ts";
+import * as DesktopIpc from "../ipc/DesktopIpc.ts";
 import { getLocalEnvironmentBootstraps } from "../ipc/methods/window.ts";
-import {
-  activateAttachedBackend,
-  refreshAttachedBackend,
-  resolveDesktopBackendLaunch,
-} from "./DesktopApp.ts";
+import * as PreviewManager from "../preview/Manager.ts";
+import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopState from "./DesktopState.ts";
+import { bootstrap, refreshAttachedBackend, resolveDesktopBackendLaunch } from "./DesktopApp.ts";
+import * as DesktopWindow from "../window/DesktopWindow.ts";
+import * as DesktopWslBackend from "../wsl/DesktopWslBackend.ts";
 
 const DESKTOP_VERSION = "0.0.37-nightly.20260904";
 const ENVIRONMENT_ID = EnvironmentId.make("reattach-environment");
@@ -159,17 +164,37 @@ describe("Desktop attach recovery", () => {
       writeRuntime(stateDir, process.pid);
       writeAttach(stateDir, "bootstrap-credential");
       primaryStartCount = 0;
+      let primaryResolutionCount = 0;
       const protocolRegistrations: ElectronProtocol.DesktopProtocolRegistrationInput[] = [];
+      const poolService = DesktopBackendPool.DesktopBackendPool.of({
+        get: () => Effect.succeed(Option.none()),
+        list: Effect.succeed([]),
+        primary: Effect.sync(() => {
+          primaryResolutionCount += 1;
+          return primary;
+        }),
+        register: () => Effect.die("unexpected backend registration"),
+        unregister: () => Effect.die("unexpected backend unregistration"),
+      });
       const layer = Layer.mergeAll(
         makeDiscoveryLayers(),
         DesktopBackendAttachment.layer,
-        DesktopBackendPool.layerTest([primary]),
+        Layer.succeed(DesktopBackendPool.DesktopBackendPool, poolService),
+        DesktopState.layer,
         Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
           stateDir,
           appVersion: DESKTOP_VERSION,
           isDevelopment: false,
           configuredBackendPort: Option.none(),
         } as DesktopEnvironment.DesktopEnvironment["Service"]),
+        Layer.succeed(
+          DesktopAppSettings.DesktopAppSettings,
+          {} as unknown as DesktopAppSettings.DesktopAppSettings["Service"],
+        ),
+        Layer.succeed(
+          DesktopServerExposure.DesktopServerExposure,
+          {} as unknown as DesktopServerExposure.DesktopServerExposure["Service"],
+        ),
         Layer.succeed(
           ElectronProtocol.ElectronProtocol,
           ElectronProtocol.ElectronProtocol.of({
@@ -179,43 +204,57 @@ describe("Desktop attach recovery", () => {
               }),
           }),
         ),
+        Layer.succeed(ElectronWindow.ElectronWindow, {
+          sendAll: () => Effect.void,
+        } as unknown as ElectronWindow.ElectronWindow["Service"]),
+        Layer.succeed(
+          DesktopIpc.DesktopIpc,
+          DesktopIpc.DesktopIpc.of({
+            handle: () => Effect.void,
+            handleSync: () => Effect.void,
+          }),
+        ),
+        Layer.succeed(PreviewManager.PreviewManager, {
+          subscribeStateChanges: () => Effect.void,
+          subscribePointerEvents: () => Effect.void,
+          subscribeRecordingFrames: () => Effect.void,
+        } as unknown as PreviewManager.PreviewManager["Service"]),
+        Layer.succeed(DesktopWindow.DesktopWindow, {
+          handleBackendReady: () => Effect.void,
+        } as unknown as DesktopWindow.DesktopWindow["Service"]),
+        Layer.succeed(
+          DesktopWslBackend.DesktopWslBackend,
+          {} as unknown as DesktopWslBackend.DesktopWslBackend["Service"],
+        ),
       );
 
-      return Effect.scoped(
-        Effect.gen(function* () {
-          const launch = yield* resolveDesktopBackendLaunch({
-            configuredPort: Option.none(),
-            stateDir,
-            desktopVersion: DESKTOP_VERSION,
-          });
-          assert.equal(launch._tag, "Attach");
-          if (launch._tag !== "Attach") return;
-          yield* activateAttachedBackend(launch.target);
-
-          const bootstraps = yield* decodeBootstraps(
-            yield* getLocalEnvironmentBootstraps.handler(),
-          );
-          assert.deepEqual(bootstraps[0], {
-            id: `attached:${ENVIRONMENT_ID}`,
-            label: "Existing T3",
-            httpBaseUrl: "http://127.0.0.1:49731/",
-            wsBaseUrl: "ws://127.0.0.1:49731/",
-            bootstrapToken: "bootstrap-credential",
-          });
-          assert.equal(primaryStartCount, 0);
-          const pool = yield* DesktopBackendPool.DesktopBackendPool;
-          const instances = yield* pool.list;
-          const snapshots = yield* Effect.forEach(instances, (instance) => instance.snapshot);
-          assert.isTrue(
-            snapshots.every(
-              (snapshot) => snapshot.desiredRunning === false && Option.isNone(snapshot.activePid),
-            ),
-          );
-          assert.equal(protocolRegistrations.length, 1);
-          assert.equal(protocolRegistrations[0]?.targetOrigin.origin, "http://127.0.0.1:49731");
-          assert.equal(protocolRegistrations[0]?.backendOrigin.origin, "http://127.0.0.1:49731");
-        }).pipe(Effect.provide(layer)),
-      );
+      const program = Effect.gen(function* () {
+        yield* bootstrap;
+        const bootstraps = yield* decodeBootstraps(yield* getLocalEnvironmentBootstraps.handler());
+        assert.deepEqual(bootstraps[0], {
+          id: `attached:${ENVIRONMENT_ID}`,
+          label: "Existing T3",
+          httpBaseUrl: "http://127.0.0.1:49731/",
+          wsBaseUrl: "ws://127.0.0.1:49731/",
+          bootstrapToken: "bootstrap-credential",
+        });
+        assert.equal(primaryStartCount, 0);
+        assert.equal(primaryResolutionCount, 0);
+        const pool = yield* DesktopBackendPool.DesktopBackendPool;
+        const instances = yield* pool.list;
+        assert.equal(instances.length, 0);
+        const snapshots = yield* Effect.forEach(instances, (instance) => instance.snapshot);
+        assert.isTrue(
+          snapshots.every(
+            (snapshot) => snapshot.desiredRunning === false && Option.isNone(snapshot.activePid),
+          ),
+        );
+        assert.equal(protocolRegistrations.length, 1);
+        assert.equal(protocolRegistrations[0]?.targetOrigin.origin, "http://127.0.0.1:49731");
+        assert.equal(protocolRegistrations[0]?.backendOrigin.origin, "http://127.0.0.1:49731");
+      }).pipe(Effect.provide(layer));
+      // @effect-diagnostics-next-line unsafeEffectTypeAssertion:off -- The mock IPC registrar deliberately does not capture every handler service; attach bootstrap only executes the services provided above.
+      return Effect.scoped(program as Effect.Effect<void, never, Scope.Scope>);
     },
   );
 
