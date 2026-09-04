@@ -5016,9 +5016,10 @@ function ChatViewContent(props: ChatViewProps) {
     return buildUiWorktreeMaterializationRequest({
       requestedProfileId: requestedMaterializationProfileId,
       contractSha256: materializationContractSha256,
-      taskCardContents: taskCardPathMatches
-        ? (materializationTaskCardQuery.data?.contents ?? null)
-        : null,
+      taskCardContents:
+        taskCardPathMatches && materializationTaskCardQuery.data?.truncated === false
+          ? materializationTaskCardQuery.data.contents
+          : null,
       taskCardPath: materializationTaskCardPath,
     });
   }, [
