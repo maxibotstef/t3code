@@ -2629,10 +2629,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
 
           assert.equal(created.materialization?.effectiveProfileId, "full");
           assert.equal(created.materialization?.reason, "task-card-materialization-failed");
-          assert.equal(
-            created.materialization?.taskCardPath,
-            "ops/stef-task/escape/stef-task.json",
-          );
+          assert.equal(created.materialization?.taskCardPath, null);
           assert.equal(created.materialization?.taskCardSha256, null);
           assert.equal(yield* fileSystem.readFileString(outsideCard), taskCardBytes);
         }),

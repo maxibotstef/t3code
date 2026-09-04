@@ -1353,16 +1353,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       taskCardGenerated: false,
       baseSha: pinnedCommit,
     });
-    if (
-      !taskCardPath ||
-      (taskCardPath !== WORKTREE_MATERIALIZATION_TASK_CARD_ROOT &&
-        !taskCardPath.startsWith(`${WORKTREE_MATERIALIZATION_TASK_CARD_ROOT}/`))
-    ) {
+    if (!taskCardPath) {
       if (state.mode !== "sparse") return fullWithoutTaskCard(state.reason);
-      return {
-        ...fullWithoutTaskCard("task-card-missing-at-base"),
-        requestedProfileId: state.requestedProfileId,
-      };
+      return fullWithoutTaskCard("task-card-missing-at-base");
+    }
+    if (
+      taskCardPath !== WORKTREE_MATERIALIZATION_TASK_CARD_ROOT &&
+      !taskCardPath.startsWith(`${WORKTREE_MATERIALIZATION_TASK_CARD_ROOT}/`)
+    ) {
+      return fullWithoutTaskCard(state.mode === "sparse" ? "task-card-outside-root" : state.reason);
     }
     const taskCardAtBase = yield* executeGit(
       "GitVcsDriver.materialization.taskCardAtBase",
@@ -1387,7 +1386,12 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           "GitVcsDriver.materialization.taskCardBytesAtBase",
         ),
       );
-      taskCardBytes = Exit.isSuccess(taskCardRead) ? taskCardRead.value : null;
+      if (Exit.isFailure(taskCardRead) || !taskCardRead.value) {
+        return fullWithoutTaskCard(
+          state.mode === "sparse" ? "task-card-unreadable-at-base" : state.reason,
+        );
+      }
+      taskCardBytes = taskCardRead.value;
       if (
         taskCardBytes &&
         sourceTaskCardBytes &&
@@ -1796,7 +1800,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           "Sparse checkout has no persisted materialization identity. Preserve changes in an ordinary named commit or operator-approved external copy, reach a clean state without automated stash/reset/clean/removal, run expand-full, then reverify.",
         );
       }
-      return FULL_WORKTREE_MATERIALIZATION_STATE;
+      return {
+        ...FULL_WORKTREE_MATERIALIZATION_STATE,
+        conePaths: [],
+        requiredPaths: [],
+      };
     }
     if (persisted.status === "failed") {
       return yield* materializationError(
@@ -3998,9 +4006,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     ])).trim();
     const pinned = yield* resolvePinnedWorktreeCommit(repoRoot, input.refName);
     const pinnedCommit = pinned.commit;
-    const contract = input.materialization
-      ? yield* readMaterializationContract(repoRoot, pinnedCommit)
-      : null;
+    const contract = yield* readMaterializationContract(repoRoot, pinnedCommit);
     const requestedMaterialization = yield* pinMaterializationRequiredPaths(
       repoRoot,
       pinnedCommit,
@@ -4019,53 +4025,83 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
     });
 
-    if (input.newRefName) {
-      let trackingRef = pinned.remoteRef;
-      if (!trackingRef) {
-        const remoteStart = yield* executeGit(
-          "GitVcsDriver.createWorktree.remoteStart",
-          repoRoot,
-          ["show-ref", "--verify", "--quiet", `refs/remotes/${input.refName}`],
-          { allowNonZeroExit: true },
-        );
-        if (remoteStart.exitCode === 0) trackingRef = input.refName;
-      }
-      const autoSetupMerge = yield* executeGit(
-        "GitVcsDriver.createWorktree.autoSetupMerge",
-        repoRoot,
-        ["config", "--get", "branch.autoSetupMerge"],
-        { allowNonZeroExit: true },
+    const sparseStateAfterAdd = Effect.fn("sparseStateAfterAdd")(function* (reason: string) {
+      const observed = yield* Effect.exit(sparseCheckoutEnabled(worktreePath));
+      if (Exit.isSuccess(observed)) return observed.value;
+      yield* writeMaterializationState(worktreePath, {
+        ...requestedMaterialization,
+        status: "failed",
+        reason,
+      });
+      return yield* materializationError(
+        "GitVcsDriver.createWorktree",
+        worktreePath,
+        "Worktree sparse-checkout state could not be read. The never-released worktree was preserved for diagnosis.",
       );
-      const autoSetupMode = autoSetupMerge.stdout.trim() || "true";
-      let upstreamToSet: string | null = null;
-      if (autoSetupMode === "inherit") {
-        const inheritedUpstream = yield* executeGit(
-          "GitVcsDriver.createWorktree.inheritedUpstream",
-          repoRoot,
-          ["rev-parse", "--abbrev-ref", `${input.refName}@{upstream}`],
-          { allowNonZeroExit: true },
-        );
-        if (inheritedUpstream.exitCode === 0) upstreamToSet = inheritedUpstream.stdout.trim();
-      } else if (trackingRef && autoSetupMode !== "false") {
-        if (autoSetupMode === "simple") {
-          const remoteNames = yield* listRemoteNames(repoRoot).pipe(Effect.orElseSucceed(() => []));
-          const remote = parseRemoteRefWithRemoteNames(
-            trackingRef,
-            remoteNames.toSorted((left, right) => right.length - left.length),
+    });
+
+    if (input.newRefName) {
+      const trackingDecision = yield* Effect.exit(
+        Effect.gen(function* () {
+          let trackingRef = pinned.remoteRef;
+          if (!trackingRef) {
+            const remoteStart = yield* executeGit(
+              "GitVcsDriver.createWorktree.remoteStart",
+              repoRoot,
+              ["show-ref", "--verify", "--quiet", `refs/remotes/${input.refName}`],
+              { allowNonZeroExit: true },
+            );
+            if (remoteStart.exitCode === 0) trackingRef = input.refName;
+          }
+          const autoSetupMerge = yield* executeGit(
+            "GitVcsDriver.createWorktree.autoSetupMerge",
+            repoRoot,
+            ["config", "--get", "branch.autoSetupMerge"],
+            { allowNonZeroExit: true },
           );
-          if (remote?.branchName === input.newRefName) upstreamToSet = trackingRef;
-        } else {
-          upstreamToSet = trackingRef;
-        }
-      } else if (autoSetupMode === "always") {
-        const localStart = yield* executeGit(
-          "GitVcsDriver.createWorktree.localTrackingStart",
-          repoRoot,
-          ["show-ref", "--verify", "--quiet", `refs/heads/${input.refName}`],
-          { allowNonZeroExit: true },
+          const autoSetupMode = (autoSetupMerge.stdout.trim() || "true").toLowerCase();
+          if (["false", "no", "off", "0"].includes(autoSetupMode)) return null;
+          if (autoSetupMode === "inherit") {
+            const inheritedUpstream = yield* executeGit(
+              "GitVcsDriver.createWorktree.inheritedUpstream",
+              repoRoot,
+              ["rev-parse", "--abbrev-ref", `${input.refName}@{upstream}`],
+              { allowNonZeroExit: true },
+            );
+            return inheritedUpstream.exitCode === 0 ? inheritedUpstream.stdout.trim() : null;
+          }
+          if (trackingRef) {
+            if (autoSetupMode !== "simple") return trackingRef;
+            const remoteNames = yield* listRemoteNames(repoRoot);
+            const remote = parseRemoteRefWithRemoteNames(
+              trackingRef,
+              remoteNames.toSorted((left, right) => right.length - left.length),
+            );
+            return remote?.branchName === input.newRefName ? trackingRef : null;
+          }
+          if (autoSetupMode !== "always") return null;
+          const localStart = yield* executeGit(
+            "GitVcsDriver.createWorktree.localTrackingStart",
+            repoRoot,
+            ["show-ref", "--verify", "--quiet", `refs/heads/${input.refName}`],
+            { allowNonZeroExit: true },
+          );
+          return localStart.exitCode === 0 ? input.refName : null;
+        }),
+      );
+      if (Exit.isFailure(trackingDecision)) {
+        yield* writeMaterializationState(worktreePath, {
+          ...requestedMaterialization,
+          status: "failed",
+          reason: "tracking-inspection-failed",
+        });
+        return yield* materializationError(
+          "GitVcsDriver.createWorktree",
+          worktreePath,
+          "Worktree branch tracking could not be inspected. The never-released worktree was preserved for diagnosis.",
         );
-        if (localStart.exitCode === 0) upstreamToSet = input.refName;
       }
+      const upstreamToSet = trackingDecision.value;
       if (upstreamToSet) {
         const preserved = yield* Effect.exit(
           runGit("GitVcsDriver.createWorktree.preserveUpstream", repoRoot, [
@@ -4140,7 +4176,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
 
       if (fallbackReason) {
-        if (yield* sparseCheckoutEnabled(worktreePath)) {
+        if (yield* sparseStateAfterAdd(`${fallbackReason}:sparse-state-unreadable`)) {
           const disabled = yield* Effect.exit(
             runGit(
               "GitVcsDriver.createWorktree.disableSparseFallback",
@@ -4187,6 +4223,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           );
         }
         const withoutTaskCardIdentity = (state: VcsWorktreeMaterializationState) => ({
+          taskCardPath: null,
           taskCardSha256: null,
           taskCardGenerated: false,
           requiredPaths: state.requiredPaths.filter(
@@ -4246,7 +4283,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         materialization = fullMaterialization;
       }
     } else {
-      if (yield* sparseCheckoutEnabled(worktreePath)) {
+      if (yield* sparseStateAfterAdd("full-sparse-state-unreadable")) {
         const disabled = yield* Effect.exit(
           runGit(
             "GitVcsDriver.createWorktree.disableInheritedSparse",
