@@ -120,6 +120,7 @@ import {
   makePersistedServerRuntimeState,
   persistServerAttachCredential,
   persistServerRuntimeState,
+  type PersistedServerRuntimeState,
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import * as NetService from "@t3tools/shared/Net";
@@ -500,6 +501,71 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(httpCompressionLayer),
 );
 
+export const persistActivatedServerRuntimeFiles = Effect.fn("server.persistActivatedRuntimeFiles")(
+  function* (input: {
+    readonly config: Pick<
+      ServerConfig.ServerConfig["Service"],
+      "desktopAttachCredential" | "serverAttachCredentialPath" | "serverRuntimeStatePath"
+    >;
+    readonly state: PersistedServerRuntimeState;
+  }) {
+    const desktopAttachCredential = input.config.desktopAttachCredential;
+    if (desktopAttachCredential) {
+      yield* Effect.gen(function* () {
+        const environment = yield* ServerEnvironment.ServerEnvironment;
+        const descriptor = yield* environment.getDescriptor;
+        const attachState = yield* makePersistedServerAttachCredential({
+          environmentId: descriptor.environmentId,
+          serverVersion: descriptor.serverVersion,
+          credential: desktopAttachCredential,
+        });
+        yield* persistServerAttachCredential({
+          path: input.config.serverAttachCredentialPath,
+          state: attachState,
+        });
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to persist server attach credential", { cause }),
+        ),
+      );
+    }
+
+    // Runtime state is the discovery commit marker. Publish it after the
+    // credential so a concurrent Desktop launch never observes a live,
+    // attach-capable owner before its attach file is ready.
+    yield* persistServerRuntimeState({
+      path: input.config.serverRuntimeStatePath,
+      state: input.state,
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to persist server runtime state", { cause }),
+      ),
+    );
+  },
+);
+
+export const clearActivatedServerRuntimeFiles = Effect.fn("server.clearActivatedRuntimeFiles")(
+  function* (
+    config: Pick<
+      ServerConfig.ServerConfig["Service"],
+      "desktopAttachCredential" | "serverAttachCredentialPath" | "serverRuntimeStatePath"
+    >,
+  ) {
+    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to clear server runtime state", { cause }),
+      ),
+    );
+    if (config.desktopAttachCredential) {
+      yield* clearPersistedServerAttachCredential(config.serverAttachCredentialPath).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to clear server attach credential", { cause }),
+        ),
+      );
+    }
+  },
+);
+
 export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
@@ -536,51 +602,12 @@ export const makeServerLayer = Layer.unwrap(
             config,
             port: address.port,
           });
-          if (config.desktopAttachCredential) {
-            const environment = yield* ServerEnvironment.ServerEnvironment;
-            const descriptor = yield* environment.getDescriptor;
-            const attachState = yield* makePersistedServerAttachCredential({
-              environmentId: descriptor.environmentId,
-              serverVersion: descriptor.serverVersion,
-              credential: config.desktopAttachCredential,
-            });
-            yield* persistServerAttachCredential({
-              path: config.serverAttachCredentialPath,
-              state: attachState,
-            });
-          }
-          // Runtime state is the discovery commit marker. Publish it after the
-          // credential so a concurrent Desktop launch never observes a live,
-          // attach-capable owner before its attach file is ready.
-          yield* persistServerRuntimeState({
-            path: config.serverRuntimeStatePath,
+          yield* persistActivatedServerRuntimeFiles({
+            config,
             state,
-          }).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to persist server runtime state", { cause }),
-            ),
-          );
+          });
         }),
-        () =>
-          Effect.all(
-            [
-              clearPersistedServerRuntimeState(config.serverRuntimeStatePath).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("Failed to clear server runtime state", { cause }),
-                ),
-              ),
-              ...(config.desktopAttachCredential
-                ? [
-                    clearPersistedServerAttachCredential(config.serverAttachCredentialPath).pipe(
-                      Effect.catchCause((cause) =>
-                        Effect.logWarning("Failed to clear server attach credential", { cause }),
-                      ),
-                    ),
-                  ]
-                : []),
-            ],
-            { concurrency: "unbounded" },
-          ).pipe(Effect.asVoid),
+        () => clearActivatedServerRuntimeFiles(config),
       ),
     );
     const tailscaleServeLayer = config.tailscaleServeEnabled

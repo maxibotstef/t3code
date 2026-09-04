@@ -10,6 +10,8 @@ import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 
+import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import { clearActivatedServerRuntimeFiles, persistActivatedServerRuntimeFiles } from "./server.ts";
 import * as ServerRuntimeState from "./serverRuntimeState.ts";
 
 const isServerRuntimeStateError = Schema.is(ServerRuntimeState.ServerRuntimeStateError);
@@ -85,6 +87,72 @@ describe("serverRuntimeState", () => {
 
       yield* ServerRuntimeState.clearPersistedServerAttachCredential(statePath);
       assert.isFalse(yield* fileSystem.exists(statePath));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("publishes and clears attach lifecycle files in commit-marker order", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-server-attach-lifecycle-test-",
+      });
+      const operations: string[] = [];
+      const trackedFileSystem = {
+        ...fileSystem,
+        rename: (fromPath: string, toPath: string) =>
+          Effect.sync(() => {
+            operations.push(`write:${path.basename(toPath)}`);
+          }).pipe(Effect.andThen(fileSystem.rename(fromPath, toPath))),
+        remove: (
+          filePath: string,
+          options?: { readonly force?: boolean; readonly recursive?: boolean },
+        ) =>
+          Effect.sync(() => {
+            operations.push(`clear:${path.basename(filePath)}`);
+          }).pipe(Effect.andThen(fileSystem.remove(filePath, options))),
+      };
+      const environmentId = EnvironmentId.make("attach-lifecycle-environment");
+      const config = {
+        desktopAttachCredential: "attach-lifecycle-credential",
+        serverAttachCredentialPath: path.join(root, "server-attach.json"),
+        serverRuntimeStatePath: path.join(root, "server-runtime.json"),
+      };
+      const environment = ServerEnvironment.ServerEnvironment.of({
+        getEnvironmentId: Effect.succeed(environmentId),
+        getDescriptor: Effect.succeed({
+          environmentId,
+          label: "Attach lifecycle",
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "0.0.37",
+          capabilities: { repositoryIdentity: true },
+        }),
+      });
+
+      yield* persistActivatedServerRuntimeFiles({
+        config,
+        state: {
+          version: 1,
+          pid: 123,
+          port: 4_971,
+          origin: "http://127.0.0.1:4971",
+          startedAt: "2026-09-04T00:00:00.000Z",
+        },
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, trackedFileSystem),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, environment),
+      );
+      assert.deepEqual(operations, ["write:server-attach.json", "write:server-runtime.json"]);
+      assert.isTrue(yield* fileSystem.exists(config.serverAttachCredentialPath));
+      assert.isTrue(yield* fileSystem.exists(config.serverRuntimeStatePath));
+
+      operations.length = 0;
+      yield* clearActivatedServerRuntimeFiles(config).pipe(
+        Effect.provideService(FileSystem.FileSystem, trackedFileSystem),
+      );
+      assert.deepEqual(operations, ["clear:server-runtime.json", "clear:server-attach.json"]);
+      assert.isFalse(yield* fileSystem.exists(config.serverRuntimeStatePath));
+      assert.isFalse(yield* fileSystem.exists(config.serverAttachCredentialPath));
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

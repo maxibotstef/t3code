@@ -104,7 +104,7 @@ const readOptionalJson = <A, I, R>(
 const toWebSocketBaseUrl = (origin: string): string => {
   const url = new URL(origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.origin;
+  return url.href;
 };
 
 const probeEnvironmentDescriptor = (
@@ -255,7 +255,7 @@ export const discoverDesktopBackend = Effect.fn("desktop.backendDiscovery.discov
       target: {
         environmentId: probed.descriptor.environmentId,
         label: probed.descriptor.label,
-        httpBaseUrl: runtimeState.value.origin,
+        httpBaseUrl: new URL(runtimeState.value.origin).href,
         wsBaseUrl: toWebSocketBaseUrl(runtimeState.value.origin),
         credential: attachCredential.value.credential,
         runtimeState: runtimeState.value,

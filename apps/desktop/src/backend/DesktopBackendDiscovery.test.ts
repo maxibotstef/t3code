@@ -136,8 +136,8 @@ describe("DesktopBackendDiscovery", () => {
       assert.equal(result._tag, "Attach");
       if (result._tag !== "Attach") return;
       assert.equal(result.target.environmentId, ENVIRONMENT_ID);
-      assert.equal(result.target.httpBaseUrl, "http://127.0.0.1:49731");
-      assert.equal(result.target.wsBaseUrl, "ws://127.0.0.1:49731");
+      assert.equal(result.target.httpBaseUrl, "http://127.0.0.1:49731/");
+      assert.equal(result.target.wsBaseUrl, "ws://127.0.0.1:49731/");
       assert.equal(result.target.credential, "fresh-attach-credential");
     });
   });

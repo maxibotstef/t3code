@@ -198,11 +198,19 @@ describe("Desktop attach recovery", () => {
           assert.deepEqual(bootstraps[0], {
             id: `attached:${ENVIRONMENT_ID}`,
             label: "Existing T3",
-            httpBaseUrl: "http://127.0.0.1:49731",
-            wsBaseUrl: "ws://127.0.0.1:49731",
+            httpBaseUrl: "http://127.0.0.1:49731/",
+            wsBaseUrl: "ws://127.0.0.1:49731/",
             bootstrapToken: "bootstrap-credential",
           });
           assert.equal(primaryStartCount, 0);
+          const pool = yield* DesktopBackendPool.DesktopBackendPool;
+          const instances = yield* pool.list;
+          const snapshots = yield* Effect.forEach(instances, (instance) => instance.snapshot);
+          assert.isTrue(
+            snapshots.every(
+              (snapshot) => snapshot.desiredRunning === false && Option.isNone(snapshot.activePid),
+            ),
+          );
           assert.equal(protocolRegistrations.length, 1);
           assert.equal(protocolRegistrations[0]?.targetOrigin.origin, "http://127.0.0.1:49731");
           assert.equal(protocolRegistrations[0]?.backendOrigin.origin, "http://127.0.0.1:49731");
@@ -254,12 +262,12 @@ describe("Desktop attach recovery", () => {
       const recovered = Option.getOrThrow(yield* attachment.current);
       assert.isTrue(recovered.ready);
       assert.equal(recovered.target.credential, "rotated-credential");
-      assert.equal(recovered.target.httpBaseUrl, "http://127.0.0.1:49732");
+      assert.equal(recovered.target.httpBaseUrl, "http://127.0.0.1:49732/");
       const recoveredBootstraps = yield* decodeBootstraps(
         yield* getLocalEnvironmentBootstraps.handler(),
       );
       assert.equal(recoveredBootstraps[0]?.bootstrapToken, "rotated-credential");
-      assert.equal(recoveredBootstraps[0]?.httpBaseUrl, "http://127.0.0.1:49732");
+      assert.equal(recoveredBootstraps[0]?.httpBaseUrl, "http://127.0.0.1:49732/");
       assert.equal(primaryStartCount, 0);
     }).pipe(Effect.provide(testLayer));
   });

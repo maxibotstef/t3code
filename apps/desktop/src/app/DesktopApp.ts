@@ -192,7 +192,6 @@ const registerAttachedBackend = Effect.fn("desktop.registerAttachedBackend")(fun
 
 export const bootstrap = Effect.gen(function* () {
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
-  const primaryBackend = yield* pool.primary;
   const state = yield* DesktopState.DesktopState;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
@@ -215,6 +214,7 @@ export const bootstrap = Effect.gen(function* () {
     return;
   }
   const backendPort = launch.port;
+  const primaryBackend = yield* pool.primary;
   yield* logBootstrapInfo(
     Option.isSome(environment.configuredBackendPort)
       ? "using configured backend port"

@@ -70,8 +70,8 @@ describe("getLocalEnvironmentBootstraps", () => {
       yield* attachment.setReady({
         environmentId,
         label: "Existing T3",
-        httpBaseUrl: "http://127.0.0.1:49731",
-        wsBaseUrl: "ws://127.0.0.1:49731",
+        httpBaseUrl: "http://127.0.0.1:49731/",
+        wsBaseUrl: "ws://127.0.0.1:49731/",
         credential: "attach-credential",
         runtimeState: {
           version: 1,
@@ -100,8 +100,8 @@ describe("getLocalEnvironmentBootstraps", () => {
       assert.deepEqual(result[0], {
         id: "attached:existing-environment",
         label: "Existing T3",
-        httpBaseUrl: "http://127.0.0.1:49731",
-        wsBaseUrl: "ws://127.0.0.1:49731",
+        httpBaseUrl: "http://127.0.0.1:49731/",
+        wsBaseUrl: "ws://127.0.0.1:49731/",
         bootstrapToken: "attach-credential",
       });
     }).pipe(
