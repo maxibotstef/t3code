@@ -205,6 +205,7 @@ const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(fun
   yield* git(cwd, ["commit", "-m", "materialization fixture"]);
   return {
     expectedContractSha256: NodeCrypto.createHash("sha256").update(raw).digest("hex"),
+    expectedTaskCardSha256: NodeCrypto.createHash("sha256").update("{}\n").digest("hex"),
   };
 });
 
@@ -1602,6 +1603,10 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         });
 
         assert.equal(
+          yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
+          yield* git(cwd, ["rev-parse", `origin/${initialBranch}^{commit}`]),
+        );
+        assert.equal(
           yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
           `origin/${initialBranch}`,
         );
@@ -1650,9 +1655,62 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           "feature/remote-only-materialized",
         );
         assert.equal(
+          yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
+          yield* git(cwd, ["rev-parse", "origin/remote-only^{commit}"]),
+        );
+        assert.equal(
           yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
           "origin/remote-only",
         );
+      }),
+    );
+
+    it.effect("refuses ambiguous bare branch names shared by two remotes", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remoteA = yield* makeTmpDir("git-worktree-ambiguous-a-");
+        const remoteB = yield* makeTmpDir("git-worktree-ambiguous-b-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remoteA, ["init", "--bare"]);
+        yield* git(remoteB, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remoteA]);
+        yield* git(cwd, ["remote", "add", "upstream", remoteB]);
+        yield* git(cwd, ["checkout", "-b", "ambiguous"]);
+        yield* git(cwd, ["push", "origin", "ambiguous"]);
+        yield* git(cwd, ["push", "upstream", "ambiguous"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* git(cwd, ["branch", "-D", "ambiguous"]);
+        yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["fetch", "upstream"]);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "ambiguous-remote-branch",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const result = yield* Effect.result(
+          driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: "ambiguous",
+            newRefName: "feature/ambiguous-remote-branch",
+            materialization: {
+              requestedProfileId: "full",
+              expectedContractSha256,
+              taskId: "OC-AMBIGUOUS",
+              taskSlug: "ambiguous-remote-branch",
+              taskCardPath: "ops/stef-task/task/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          }),
+        );
+
+        assert.equal(result._tag, "Failure");
+        assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
     );
 
@@ -1725,6 +1783,31 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           allowNonZeroExit: true,
         });
         assert.notEqual(emptyModeUpstream.exitCode, 0);
+
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "off"]);
+        const offModePath = pathService.join(yield* makeTmpDir("git-worktrees-"), "off-auto-setup");
+        yield* driver.createWorktree({
+          cwd,
+          path: offModePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/off-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-OFF",
+            taskSlug: "off-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const offModeUpstream = yield* driver.execute({
+          operation: "test.offAutoSetup",
+          args: ["rev-parse", "--abbrev-ref", "@{upstream}"],
+          cwd: offModePath,
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(offModeUpstream.exitCode, 0);
       }),
     );
 
@@ -1764,6 +1847,31 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(
           yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
           `origin/${initialBranch}`,
+        );
+
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "always"]);
+        const alwaysPath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "always-auto-setup",
+        );
+        yield* driver.createWorktree({
+          cwd,
+          path: alwaysPath,
+          refName: initialBranch,
+          newRefName: "feature/always-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-ALWAYS",
+            taskSlug: "always-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(
+          yield* git(alwaysPath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          initialBranch,
         );
       }),
     );
@@ -2253,7 +2361,14 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         });
         assert.equal(created.materialization?.effectiveProfileId, "governance-review");
         assert.match(created.materialization?.taskCardSha256 ?? "", /^[a-f0-9]{64}$/);
-        assert.equal(yield* fileSystem.exists(pathService.join(worktreePath, taskCardPath)), true);
+        assert.equal(
+          yield* fileSystem.readFileString(pathService.join(worktreePath, taskCardPath)),
+          taskCardBytes,
+        );
+        assert.equal(
+          (yield* driver.verifyWorktreeMaterialization(worktreePath)).effectiveProfileId,
+          "governance-review",
+        );
         assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
         assert.equal(
           yield* git(cwd, ["config", "--get", "core.excludesFile"]),
@@ -2419,12 +2534,18 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           recursive: true,
         });
         yield* fileSystem.writeFileString(defaultExcludePath, "*.xdg-only\n");
+        const emptyGlobalConfig = pathService.join(xdgRoot, "empty-global-config");
+        yield* fileSystem.writeFileString(emptyGlobalConfig, "");
         const previousXdg = process.env.XDG_CONFIG_HOME;
+        const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
         process.env.XDG_CONFIG_HOME = xdgRoot;
+        process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
             if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
             else process.env.XDG_CONFIG_HOME = previousXdg;
+            if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+            else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
           }),
         );
         const worktreePath = pathService.join(
@@ -2529,7 +2650,8 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
-        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const { expectedContractSha256, expectedTaskCardSha256 } =
+          yield* writeMaterializationFixture(cwd);
         yield* git(cwd, ["config", "core.autocrlf", "true"]);
         const pathService = yield* Path.Path;
         const worktreePath = pathService.join(
@@ -2555,6 +2677,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         });
 
         assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.equal(created.materialization?.taskCardSha256, expectedTaskCardSha256);
         assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "sparse");
         const expanded = yield* driver.expandWorktreeMaterializationFull(
           worktreePath,
@@ -2774,6 +2897,35 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         });
         assert.equal(created.materialization?.effectiveProfileId, "full");
         assert.equal(created.materialization?.reason, "unsupported:unclassified");
+      }),
+    );
+
+    it.effect("falls back to full when requested work is outside the selected profile cone", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "outside-profile-cone"),
+          refName: initialBranch,
+          newRefName: "feature/outside-profile-cone",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-CONE",
+            taskSlug: "outside-profile-cone",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["strategies/source.ts"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "multi-domain");
       }),
     );
 
