@@ -82,6 +82,7 @@ const STATUS_DEFAULT_BRANCH_CACHE_TTL = Duration.minutes(5);
 const STATUS_ORIGIN_EXISTS_CACHE_TTL = Duration.minutes(5);
 const WORKTREE_MATERIALIZATION_CONTRACT_PATH = "config/worktree-materialization-profiles.json";
 const WORKTREE_MATERIALIZATION_CONTRACT_SCHEMA = "clawd.worktree-materialization-profiles.v1";
+const WORKTREE_MATERIALIZATION_TASK_CARD_ROOT = "ops/stef-task";
 const SUPPORTED_SPARSE_TASK_CLASSES = new Set(["source-task", "task-evidence"]);
 const WORKTREE_MATERIALIZATION_STATE_SCHEMA = "clawd.worktree-materialization-state.v1";
 const WORKTREE_MATERIALIZATION_STATE_FILE = "worktree-materialization.json";
@@ -1299,18 +1300,29 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     pinnedCommit: string,
     state: VcsWorktreeMaterializationState,
   ) {
-    if (state.mode !== "sparse") return { ...state, baseSha: pinnedCommit };
     const taskCardPath = state.taskCardPath;
-    if (!taskCardPath) {
+    const fullWithoutTaskCard = (reason: string | null) => ({
+      ...state,
+      effectiveProfileId: "full",
+      mode: "full" as const,
+      reason,
+      manifestSha256: null,
+      conePaths: [],
+      requiredPaths: [],
+      taskCardPath: null,
+      taskCardSha256: null,
+      taskCardGenerated: false,
+      baseSha: pinnedCommit,
+    });
+    if (
+      !taskCardPath ||
+      (taskCardPath !== WORKTREE_MATERIALIZATION_TASK_CARD_ROOT &&
+        !taskCardPath.startsWith(`${WORKTREE_MATERIALIZATION_TASK_CARD_ROOT}/`))
+    ) {
+      if (state.mode !== "sparse") return fullWithoutTaskCard(state.reason);
       return {
-        ...state,
-        effectiveProfileId: "full",
-        mode: "full" as const,
-        reason: "task-card-missing-at-base",
-        manifestSha256: null,
-        conePaths: [],
-        requiredPaths: [],
-        baseSha: pinnedCommit,
+        ...fullWithoutTaskCard("task-card-missing-at-base"),
+        requestedProfileId: state.requestedProfileId,
       };
     }
     const taskCardAtBase = yield* executeGit(
@@ -1340,6 +1352,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         worktreeMaterializationSha256(taskCardBytes) !==
           worktreeMaterializationSha256(sourceTaskCardBytes)
       ) {
+        const requiredPaths = uniqueMaterializationPaths([taskCardPath]);
         return {
           ...state,
           effectiveProfileId: "full",
@@ -1347,7 +1360,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           reason: "task-card-source-mismatch",
           manifestSha256: null,
           conePaths: [],
-          requiredPaths: [],
+          requiredPaths,
+          taskCardSha256: worktreeMaterializationSha256(taskCardBytes),
+          taskCardGenerated: false,
           baseSha: pinnedCommit,
         };
       }
@@ -1355,26 +1370,21 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       taskCardBytes = sourceTaskCardBytes;
     }
     if (!taskCardBytes) {
-      return {
-        ...state,
-        effectiveProfileId: "full",
-        mode: "full" as const,
-        reason: "task-card-missing-at-base",
-        manifestSha256: null,
-        conePaths: [],
-        requiredPaths: [],
-        baseSha: pinnedCommit,
-      };
+      return fullWithoutTaskCard(
+        state.mode === "sparse" ? "task-card-missing-at-base" : state.reason,
+      );
     }
     const presentDynamicPaths: Array<string> = [];
-    for (const candidate of state.declaredDynamicPaths ?? []) {
-      const result = yield* executeGit(
-        "GitVcsDriver.materialization.pathAtBase",
-        repoRoot,
-        ["cat-file", "-e", `${pinnedCommit}:${candidate}`],
-        { allowNonZeroExit: true },
-      );
-      if (result.exitCode === 0) presentDynamicPaths.push(candidate);
+    if (state.mode === "sparse") {
+      for (const candidate of state.declaredDynamicPaths ?? []) {
+        const result = yield* executeGit(
+          "GitVcsDriver.materialization.pathAtBase",
+          repoRoot,
+          ["cat-file", "-e", `${pinnedCommit}:${candidate}`],
+          { allowNonZeroExit: true },
+        );
+        if (result.exitCode === 0) presentDynamicPaths.push(candidate);
+      }
     }
     const requiredPaths = uniqueMaterializationPaths([
       ...state.requiredPaths,
@@ -1387,14 +1397,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       taskCardSha256: worktreeMaterializationSha256(taskCardBytes),
       taskCardGenerated: taskCardAtBase.exitCode !== 0,
       requiredPaths,
-      manifestSha256: worktreeMaterializationSha256(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        JSON.stringify({
-          profileId: state.effectiveProfileId,
-          conePaths: state.conePaths,
-          requiredPaths,
-        }),
-      ),
+      manifestSha256:
+        state.mode === "sparse"
+          ? worktreeMaterializationSha256(
+              // @effect-diagnostics-next-line preferSchemaOverJson:off
+              JSON.stringify({
+                profileId: state.effectiveProfileId,
+                conePaths: state.conePaths,
+                requiredPaths,
+              }),
+            )
+          : state.manifestSha256,
     };
   });
 
@@ -1737,7 +1750,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         return yield* materializationError(
           "GitVcsDriver.verifyWorktreeMaterialization",
           cwd,
-          `Exact task card bytes do not match the persisted identity. ${WORKTREE_MATERIALIZATION_RECOVERY}`,
+          persisted.taskCardGenerated
+            ? "Generated task card bytes do not match the persisted identity. Restore the exact task card bytes, then run expand-full and reverify."
+            : "Tracked task card changed from the materialization base. Preserve the work in a named commit and create a new worktree with a new explicit task-card identity; expand-full cannot rebind it.",
         );
       }
       if (!(yield* generatedTaskCardIsIgnored(cwd, persisted))) {
@@ -1843,7 +1858,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       return yield* materializationError(
         "GitVcsDriver.verifyWorktreeMaterialization",
         cwd,
-        `Exact task card bytes do not match the persisted identity. ${WORKTREE_MATERIALIZATION_RECOVERY}`,
+        persisted.taskCardGenerated
+          ? "Generated task card bytes do not match the persisted identity. Restore the exact task card bytes, then run expand-full and reverify."
+          : "Tracked task card changed from the materialization base. Preserve the work in a named commit and create a new worktree with a new explicit task-card identity; expand-full cannot rebind it.",
       );
     }
     if (!(yield* generatedTaskCardIsIgnored(cwd, persisted))) {
@@ -1871,6 +1888,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         );
       }
       const persisted = yield* readMaterializationState(cwd);
+      if (persisted && !(yield* taskCardIdentityMatches(cwd, persisted))) {
+        return yield* materializationError(
+          "GitVcsDriver.expandWorktreeMaterializationFull",
+          cwd,
+          persisted.taskCardGenerated
+            ? "Generated task card bytes do not match the persisted identity. Restore the exact task card bytes before expand-full."
+            : "Tracked task card changed from the materialization base. Preserve the work in a named commit and create a new worktree with a new explicit task-card identity; expand-full cannot rebind it.",
+        );
+      }
       const wasSparse = yield* sparseCheckoutEnabled(cwd);
       const needsSparseDisable =
         wasSparse || persisted?.mode === "sparse" || persisted?.status === "failed";
@@ -1905,19 +1931,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           `Full expansion is missing required path(s): ${missing.join(", ")}`,
         );
       }
-      const currentTaskCard = baseState.taskCardPath
-        ? yield* Effect.exit(fileSystem.readFile(path.join(cwd, baseState.taskCardPath)))
-        : null;
       const nextState: VcsWorktreeMaterializationState = {
         ...baseState,
         status: "ready",
         effectiveProfileId: "full",
         mode: "full",
         reason: reason.trim() || "expand-full",
-        taskCardSha256:
-          baseState.taskCardGenerated && currentTaskCard && Exit.isSuccess(currentTaskCard)
-            ? worktreeMaterializationSha256(currentTaskCard.value)
-            : (baseState.taskCardSha256 ?? null),
+        taskCardSha256: baseState.taskCardSha256 ?? null,
         baseSha: baseState.baseSha ?? baseSha,
       };
       // Preserve the requested sparse manifest as provenance. Only the

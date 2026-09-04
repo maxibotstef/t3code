@@ -1875,7 +1875,8 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const { initialBranch } = yield* initRepoWithCommit(cwd);
         const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
         const taskCardPath = "ops/stef-task/generated/stef-task.json";
-        yield* writeTextFile(cwd, taskCardPath, '{"issue":{"id":"OC-GENERATED"}}\n');
+        const taskCardBytes = '{"issue":{"id":"OC-GENERATED"}}\n';
+        yield* writeTextFile(cwd, taskCardPath, taskCardBytes);
         const pathService = yield* Path.Path;
         const fileSystem = yield* FileSystem.FileSystem;
         const inheritedExcludePath = pathService.join(
@@ -1933,9 +1934,21 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           "Failure",
         );
         assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
+        const tamperedExpansion = yield* Effect.result(
+          driver.expandWorktreeMaterializationFull(worktreePath, "must-not-rebind-generated-card"),
+        );
+        assert.equal(tamperedExpansion._tag, "Failure");
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+          false,
+        );
+        yield* fileSystem.writeFileString(
+          pathService.join(worktreePath, taskCardPath),
+          taskCardBytes,
+        );
         const expanded = yield* driver.expandWorktreeMaterializationFull(
           worktreePath,
-          "rebind-generated-card",
+          "restored-generated-card",
         );
         assert.equal(expanded.effectiveProfileId, "full");
         assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
@@ -2230,6 +2243,48 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(created.materialization?.effectiveProfileId, "full");
         assert.equal(created.materialization?.taskCardPath, null);
         assert.deepStrictEqual(created.materialization?.scopePaths, []);
+      }),
+    );
+
+    it.effect("carries a valid generated task card through explicit full materialization", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const taskCardPath = "ops/stef-task/generated-full/stef-task.json";
+        const taskCardBytes = '{"issue":{"id":"OC-FULL-CARD"}}\n';
+        yield* writeTextFile(cwd, taskCardPath, taskCardBytes);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-full-card",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-full-card",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-FULL-CARD",
+            taskSlug: "generated-full",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.taskCardGenerated, true);
+        assert.equal(
+          yield* fileSystem.readFileString(pathService.join(worktreePath, taskCardPath)),
+          taskCardBytes,
+        );
+        assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
       }),
     );
 
