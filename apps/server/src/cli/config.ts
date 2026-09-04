@@ -379,6 +379,7 @@ export const resolveServerConfig = (
       noBrowser,
       startupPresentation,
       desktopBootstrapToken,
+      desktopAttachCredential: undefined,
       desktopTelemetryFd,
       desktopTelemetryControlFd,
       resourceMonitorPath,

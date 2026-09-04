@@ -1,12 +1,15 @@
+import { DesktopEnvironmentBootstrapSchema, EnvironmentId } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import { vi } from "vite-plus/test";
 
 import type * as Electron from "electron";
 
 import * as DesktopBackendManager from "../../backend/DesktopBackendManager.ts";
+import * as DesktopBackendAttachment from "../../backend/DesktopBackendAttachment.ts";
 import * as DesktopBackendPool from "../../backend/DesktopBackendPool.ts";
 import * as ElectronDialog from "../../electron/ElectronDialog.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
@@ -39,6 +42,10 @@ const readyWslConfig: DesktopBackendManager.DesktopBackendStartConfig = {
   runningDistro: "Ubuntu",
 };
 
+const decodeBootstraps = Schema.decodeUnknownEffect(
+  Schema.Array(DesktopEnvironmentBootstrapSchema),
+);
+
 const defaultWslInstance: DesktopBackendManager.DesktopBackendInstance = {
   id: DesktopBackendManager.BackendInstanceId("wsl:default"),
   label: Effect.succeed("WSL (default distro)"),
@@ -56,6 +63,57 @@ const defaultWslInstance: DesktopBackendManager.DesktopBackendInstance = {
 };
 
 describe("getLocalEnvironmentBootstraps", () => {
+  it.effect("publishes an attached owner with its external environment identity", () =>
+    Effect.gen(function* () {
+      const attachment = yield* DesktopBackendAttachment.DesktopBackendAttachment;
+      const environmentId = EnvironmentId.make("existing-environment");
+      yield* attachment.setReady({
+        environmentId,
+        label: "Existing T3",
+        httpBaseUrl: "http://127.0.0.1:49731",
+        wsBaseUrl: "ws://127.0.0.1:49731",
+        credential: "attach-credential",
+        runtimeState: {
+          version: 1,
+          pid: 123,
+          port: 49_731,
+          origin: "http://127.0.0.1:49731",
+          startedAt: "2026-09-04T00:00:00.000Z",
+        },
+        attachCredential: {
+          version: 1,
+          environmentId,
+          serverVersion: "0.0.37",
+          credential: "attach-credential",
+          createdAt: "2026-09-04T00:00:00.000Z",
+        },
+        descriptor: {
+          environmentId,
+          label: "Existing T3",
+          platform: { os: "darwin", arch: "arm64" },
+          serverVersion: "0.0.37",
+          capabilities: { repositoryIdentity: true },
+        },
+      });
+
+      const result = yield* decodeBootstraps(yield* getLocalEnvironmentBootstraps.handler());
+      assert.deepEqual(result[0], {
+        id: "attached:existing-environment",
+        label: "Existing T3",
+        httpBaseUrl: "http://127.0.0.1:49731",
+        wsBaseUrl: "ws://127.0.0.1:49731",
+        bootstrapToken: "attach-credential",
+      });
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          DesktopBackendPool.layerTest([defaultWslInstance]),
+          DesktopBackendAttachment.layer,
+        ),
+      ),
+    ),
+  );
+
   it.effect("publishes the concrete running distro without replacing the stable instance id", () =>
     Effect.gen(function* () {
       const result = yield* getLocalEnvironmentBootstraps.handler();

@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
+import { EnvironmentId } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -60,6 +61,42 @@ describe("serverRuntimeState", () => {
       });
       assert.isFalse("devUrl" in withoutDev);
     }),
+  );
+
+  it.effect("persists attach credentials privately and clears them on shutdown", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-server-attach-state-test-",
+      });
+      const statePath = path.join(root, "runtime", "server-attach.json");
+      const state = yield* ServerRuntimeState.makePersistedServerAttachCredential({
+        environmentId: EnvironmentId.make("attach-environment"),
+        serverVersion: "0.0.37-nightly.20260904",
+        credential: "attach-credential",
+      });
+
+      yield* ServerRuntimeState.persistServerAttachCredential({ path: statePath, state });
+      const restored = yield* ServerRuntimeState.readPersistedServerAttachCredential(statePath);
+      const info = yield* fileSystem.stat(statePath);
+      assert.deepEqual(Option.getOrThrow(restored), state);
+      assert.equal(info.mode & 0o777, 0o600);
+
+      yield* ServerRuntimeState.clearPersistedServerAttachCredential(statePath);
+      assert.isFalse(yield* fileSystem.exists(statePath));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("rotates the attach credential for each server activation", () =>
+    Effect.gen(function* () {
+      const first = yield* ServerRuntimeState.generateServerAttachCredential;
+      const second = yield* ServerRuntimeState.generateServerAttachCredential;
+
+      assert.match(first, /^[0-9a-f]{48}$/);
+      assert.match(second, /^[0-9a-f]{48}$/);
+      assert.notEqual(first, second);
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("treats a missing runtime state file as absent", () =>

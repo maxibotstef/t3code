@@ -142,6 +142,31 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
+  it.effect("exchanges desktop attach grants only for standard client scopes", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const standard = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        "desktop-attach-token",
+        undefined,
+        requestMetadata,
+      );
+      const administrative = yield* serverAuth
+        .exchangeBootstrapCredentialForAccessToken(
+          "desktop-attach-token",
+          AuthAdministrativeScopes,
+          requestMetadata,
+        )
+        .pipe(Effect.flip);
+
+      expect(standard.scope).toBe(
+        "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+      );
+      expect(administrative._tag).toBe("ServerAuthScopeNotGrantedError");
+    }).pipe(
+      Effect.provide(makeEnvironmentAuthLayer({ desktopAttachCredential: "desktop-attach-token" })),
+    ),
+  );
+
   it.effect("inherits a constrained pairing grant when token exchange omits scope", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

@@ -329,6 +329,19 @@ export const make = Effect.gen(function* () {
     });
   }
 
+  if (config.desktopAttachCredential) {
+    const now = yield* DateTime.now;
+    yield* seedGrant(config.desktopAttachCredential, {
+      method: "desktop-bootstrap",
+      scopes: AuthStandardClientScopes,
+      subject: "desktop-attach",
+      expiresAt: DateTime.add(now, {
+        milliseconds: Duration.toMillis(DESKTOP_BOOTSTRAP_TTL_HOURS),
+      }),
+      remainingUses: "unbounded",
+    });
+  }
+
   const listActive: PairingGrantStore["Service"]["listActive"] = Effect.fn(
     "PairingGrantStore.listActive",
   )(

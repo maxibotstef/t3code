@@ -102,6 +102,26 @@ function makePoolLayer(
 }
 
 describe("DesktopBackendPool", () => {
+  it.effect("tears down an attach-mode pool without starting its primary", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const labelRef = yield* Ref.make("Windows");
+        const pool = yield* DesktopBackendPool.DesktopBackendPool.pipe(
+          Effect.provide(makePoolLayer(labelRef)),
+        );
+
+        const primary = yield* pool.primary;
+        assert.deepEqual(yield* primary.snapshot, {
+          desiredRunning: false,
+          ready: false,
+          activePid: Option.none(),
+          restartAttempt: 0,
+          restartScheduled: false,
+        });
+      }),
+    ),
+  );
+
   it.effect("layerTest exposes registered instances by id", () =>
     Effect.gen(function* () {
       const pool = yield* DesktopBackendPool.DesktopBackendPool;

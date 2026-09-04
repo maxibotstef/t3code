@@ -114,8 +114,11 @@ import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
+  clearPersistedServerAttachCredential,
   clearPersistedServerRuntimeState,
+  makePersistedServerAttachCredential,
   makePersistedServerRuntimeState,
+  persistServerAttachCredential,
   persistServerRuntimeState,
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
@@ -533,6 +536,22 @@ export const makeServerLayer = Layer.unwrap(
             config,
             port: address.port,
           });
+          if (config.desktopAttachCredential) {
+            const environment = yield* ServerEnvironment.ServerEnvironment;
+            const descriptor = yield* environment.getDescriptor;
+            const attachState = yield* makePersistedServerAttachCredential({
+              environmentId: descriptor.environmentId,
+              serverVersion: descriptor.serverVersion,
+              credential: config.desktopAttachCredential,
+            });
+            yield* persistServerAttachCredential({
+              path: config.serverAttachCredentialPath,
+              state: attachState,
+            });
+          }
+          // Runtime state is the discovery commit marker. Publish it after the
+          // credential so a concurrent Desktop launch never observes a live,
+          // attach-capable owner before its attach file is ready.
           yield* persistServerRuntimeState({
             path: config.serverRuntimeStatePath,
             state,
@@ -543,11 +562,25 @@ export const makeServerLayer = Layer.unwrap(
           );
         }),
         () =>
-          clearPersistedServerRuntimeState(config.serverRuntimeStatePath).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to clear server runtime state", { cause }),
-            ),
-          ),
+          Effect.all(
+            [
+              clearPersistedServerRuntimeState(config.serverRuntimeStatePath).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to clear server runtime state", { cause }),
+                ),
+              ),
+              ...(config.desktopAttachCredential
+                ? [
+                    clearPersistedServerAttachCredential(config.serverAttachCredentialPath).pipe(
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning("Failed to clear server attach credential", { cause }),
+                      ),
+                    ),
+                  ]
+                : []),
+            ],
+            { concurrency: "unbounded" },
+          ).pipe(Effect.asVoid),
       ),
     );
     const tailscaleServeLayer = config.tailscaleServeEnabled

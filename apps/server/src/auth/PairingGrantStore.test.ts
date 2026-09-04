@@ -13,7 +13,9 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 
 const makeServerConfigLayer = (
-  overrides?: Partial<Pick<ServerConfig.ServerConfig["Service"], "desktopBootstrapToken">>,
+  overrides?: Partial<
+    Pick<ServerConfig.ServerConfig["Service"], "desktopAttachCredential" | "desktopBootstrapToken">
+  >,
 ) =>
   Layer.effect(
     ServerConfig.ServerConfig,
@@ -29,7 +31,9 @@ const makeServerConfigLayer = (
   );
 
 const makePairingGrantStoreLayer = (
-  overrides?: Partial<Pick<ServerConfig.ServerConfig["Service"], "desktopBootstrapToken">>,
+  overrides?: Partial<
+    Pick<ServerConfig.ServerConfig["Service"], "desktopAttachCredential" | "desktopBootstrapToken">
+  >,
 ) =>
   PairingGrantStore.layer.pipe(
     Layer.provide(SqlitePersistenceMemory),
@@ -187,6 +191,37 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         Layer.merge(
           makePairingGrantStoreLayer({
             desktopBootstrapToken: "desktop-bootstrap-token",
+          }),
+          TestClock.layer(),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("seeds the desktop attach credential as a reusable standard grant", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const first = yield* bootstrapCredentials.consume("desktop-attach-token");
+      const second = yield* bootstrapCredentials.consume("desktop-attach-token");
+
+      expect(first.method).toBe("desktop-bootstrap");
+      expect(first.subject).toBe("desktop-attach");
+      expect(first.scopes).toEqual([
+        "orchestration:read",
+        "orchestration:operate",
+        "terminal:operate",
+        "review:write",
+        "relay:read",
+      ]);
+      expect(second.subject).toBe("desktop-attach");
+      yield* TestClock.adjust(Duration.hours(25));
+      const expired = yield* Effect.flip(bootstrapCredentials.consume("desktop-attach-token"));
+      expect(expired._tag).toBe("ExpiredBootstrapCredentialError");
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          makePairingGrantStoreLayer({
+            desktopAttachCredential: "desktop-attach-token",
           }),
           TestClock.layer(),
         ),

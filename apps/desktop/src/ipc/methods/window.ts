@@ -22,6 +22,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as DesktopBackendPool from "../../backend/DesktopBackendPool.ts";
+import * as DesktopBackendAttachment from "../../backend/DesktopBackendAttachment.ts";
 import * as DesktopLocalEnvironmentAuth from "../../backend/DesktopLocalEnvironmentAuth.ts";
 import * as DesktopEnvironment from "../../app/DesktopEnvironment.ts";
 import * as DesktopAppSettings from "../../settings/DesktopAppSettings.ts";
@@ -90,8 +91,20 @@ export const getLocalEnvironmentBootstraps = DesktopIpc.makeSyncIpcMethod({
   result: Schema.Array(DesktopEnvironmentBootstrapSchema),
   handler: Effect.fn("desktop.ipc.window.getLocalEnvironmentBootstraps")(function* () {
     const pool = yield* DesktopBackendPool.DesktopBackendPool;
+    const attachment = yield* DesktopBackendAttachment.DesktopBackendAttachment;
     const instances = yield* pool.list;
     const bootstraps: DesktopEnvironmentBootstrap[] = [];
+    const attached = yield* attachment.current;
+    if (Option.isSome(attached)) {
+      const { target, ready } = attached.value;
+      bootstraps.push({
+        id: `attached:${target.environmentId}`,
+        label: target.label,
+        httpBaseUrl: ready ? target.httpBaseUrl : null,
+        wsBaseUrl: ready ? target.wsBaseUrl : null,
+        ...(ready ? { bootstrapToken: target.credential } : {}),
+      });
+    }
     for (const instance of instances) {
       const isPrimary = instance.id === PRIMARY_LOCAL_ENVIRONMENT_ID;
       const config = yield* instance.currentConfig;

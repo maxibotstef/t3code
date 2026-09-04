@@ -4,7 +4,6 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
-import * as NetService from "@t3tools/shared/Net";
 import * as Crypto from "effect/Crypto";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
@@ -15,6 +14,11 @@ import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopClerk from "./DesktopClerk.ts";
 import * as DesktopApplicationMenu from "../window/DesktopApplicationMenu.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
+import * as DesktopBackendAttachment from "../backend/DesktopBackendAttachment.ts";
+import {
+  discoverDesktopBackend,
+  type DesktopBackendAttachTarget,
+} from "../backend/DesktopBackendDiscovery.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./DesktopLifecycle.ts";
@@ -29,27 +33,10 @@ import * as DesktopState from "./DesktopState.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopWslBackend from "../wsl/DesktopWslBackend.ts";
 
-const DEFAULT_DESKTOP_BACKEND_PORT = 3773;
-const MAX_TCP_PORT = 65_535;
-const DESKTOP_BACKEND_PORT_PROBE_HOSTS = ["127.0.0.1", "0.0.0.0", "::"] as const;
-
 const makeDesktopRunId = Crypto.Crypto.pipe(
   Effect.flatMap((crypto) => crypto.randomUUIDv4),
   Effect.map((value) => value.replaceAll("-", "").slice(0, 12)),
 );
-
-export class DesktopBackendPortUnavailableError extends Schema.TaggedErrorClass<DesktopBackendPortUnavailableError>()(
-  "DesktopBackendPortUnavailableError",
-  {
-    startPort: Schema.Int,
-    maxPort: Schema.Int,
-    hosts: Schema.Array(Schema.String),
-  },
-) {
-  override get message(): string {
-    return `No desktop backend port is available on hosts ${this.hosts.join(", ")} between ${this.startPort} and ${this.maxPort}.`;
-  }
-}
 
 export class DesktopDevelopmentBackendPortRequiredError extends Schema.TaggedErrorClass<DesktopDevelopmentBackendPortRequiredError>()(
   "DesktopDevelopmentBackendPortRequiredError",
@@ -65,42 +52,6 @@ const { logInfo: logBootstrapInfo, logWarning: logBootstrapWarning } =
 
 const { logInfo: logStartupInfo, logError: logStartupError } =
   DesktopObservability.makeComponentLogger("desktop-startup");
-
-const resolveDesktopBackendPort = Effect.fn("resolveDesktopBackendPort")(function* (
-  configuredPort: Option.Option<number>,
-) {
-  if (Option.isSome(configuredPort)) {
-    return {
-      port: configuredPort.value,
-      selectedByScan: false,
-    } as const;
-  }
-
-  const net = yield* NetService.NetService;
-  for (let port = DEFAULT_DESKTOP_BACKEND_PORT; port <= MAX_TCP_PORT; port += 1) {
-    let availableOnEveryHost = true;
-
-    for (const host of DESKTOP_BACKEND_PORT_PROBE_HOSTS) {
-      if (!(yield* net.canListenOnHost(port, host))) {
-        availableOnEveryHost = false;
-        break;
-      }
-    }
-
-    if (availableOnEveryHost) {
-      return {
-        port,
-        selectedByScan: true,
-      } as const;
-    }
-  }
-
-  return yield* new DesktopBackendPortUnavailableError({
-    startPort: DEFAULT_DESKTOP_BACKEND_PORT,
-    maxPort: MAX_TCP_PORT,
-    hosts: DESKTOP_BACKEND_PORT_PROBE_HOSTS,
-  });
-});
 
 const handleFatalStartupError = Effect.fn("desktop.startup.handleFatalStartupError")(function* (
   stage: string,
@@ -139,7 +90,107 @@ const handleFatalStartupError = Effect.fn("desktop.startup.handleFatalStartupErr
 const fatalStartupCause = <E>(stage: string, cause: Cause.Cause<E>) =>
   handleFatalStartupError(stage, Cause.pretty(cause)).pipe(Effect.andThen(Effect.failCause(cause)));
 
-const bootstrap = Effect.gen(function* () {
+export const refreshAttachedBackend = Effect.fn("desktop.refreshAttachedBackend")(
+  function* (input: {
+    readonly stateDir: string;
+    readonly desktopVersion: string;
+    readonly expectedEnvironmentId: string;
+  }) {
+    const attachment = yield* DesktopBackendAttachment.DesktopBackendAttachment;
+    const discovered = yield* discoverDesktopBackend({
+      stateDir: input.stateDir,
+      desktopVersion: input.desktopVersion,
+    });
+    if (
+      discovered._tag === "Attach" &&
+      discovered.target.environmentId === input.expectedEnvironmentId
+    ) {
+      yield* attachment.setReady(discovered.target);
+      return;
+    }
+    yield* attachment.markUnready(input.expectedEnvironmentId);
+  },
+);
+
+const monitorAttachedBackend = (input: {
+  readonly stateDir: string;
+  readonly desktopVersion: string;
+  readonly expectedEnvironmentId: string;
+}) =>
+  Effect.sleep("3 seconds").pipe(
+    Effect.andThen(refreshAttachedBackend(input)),
+    Effect.forever,
+    Effect.withSpan("desktop.monitorAttachedBackend"),
+  );
+
+export type DesktopBackendLaunch =
+  | { readonly _tag: "Attach"; readonly target: DesktopBackendAttachTarget }
+  | { readonly _tag: "Spawn"; readonly port: number };
+
+export const resolveDesktopBackendLaunch = Effect.fn("desktop.resolveBackendLaunch")(
+  function* (input: {
+    readonly configuredPort: Option.Option<number>;
+    readonly stateDir: string;
+    readonly desktopVersion: string;
+  }) {
+    if (Option.isSome(input.configuredPort)) {
+      return { _tag: "Spawn", port: input.configuredPort.value } satisfies DesktopBackendLaunch;
+    }
+    const result = yield* discoverDesktopBackend({
+      stateDir: input.stateDir,
+      desktopVersion: input.desktopVersion,
+    });
+    if (result._tag === "Refuse") return yield* result.error;
+    return result;
+  },
+);
+
+export const activateAttachedBackend = Effect.fn("desktop.activateAttachedBackend")(function* (
+  target: DesktopBackendAttachTarget,
+) {
+  const attachment = yield* DesktopBackendAttachment.DesktopBackendAttachment;
+  const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
+  const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const targetOrigin = new URL(target.httpBaseUrl);
+
+  yield* electronProtocol.registerDesktopProtocol({
+    scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
+    targetOrigin,
+    backendOrigin: targetOrigin,
+    clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
+  });
+  yield* attachment.setReady(target);
+  return targetOrigin;
+});
+
+const registerAttachedBackend = Effect.fn("desktop.registerAttachedBackend")(function* (
+  target: DesktopBackendAttachTarget,
+) {
+  const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const state = yield* DesktopState.DesktopState;
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  const targetOrigin = yield* activateAttachedBackend(target);
+
+  yield* logBootstrapInfo("bootstrap attached to existing backend", {
+    environmentId: target.environmentId,
+    baseUrl: target.httpBaseUrl,
+  });
+  yield* installDesktopIpcHandlers();
+  yield* logBootstrapInfo("bootstrap ipc handlers registered");
+
+  if (!(yield* Ref.get(state.quitting))) {
+    yield* desktopWindow.handleBackendReady(targetOrigin);
+    yield* Effect.forkScoped(
+      monitorAttachedBackend({
+        stateDir: environment.stateDir,
+        desktopVersion: environment.appVersion,
+        expectedEnvironmentId: target.environmentId,
+      }),
+    );
+  }
+});
+
+export const bootstrap = Effect.gen(function* () {
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
   const primaryBackend = yield* pool.primary;
   const state = yield* DesktopState.DesktopState;
@@ -154,16 +205,21 @@ const bootstrap = Effect.gen(function* () {
     return yield* new DesktopDevelopmentBackendPortRequiredError();
   }
 
-  const backendPortSelection = yield* resolveDesktopBackendPort(environment.configuredBackendPort);
-  const backendPort = backendPortSelection.port;
+  const launch = yield* resolveDesktopBackendLaunch({
+    configuredPort: environment.configuredBackendPort,
+    stateDir: environment.stateDir,
+    desktopVersion: environment.appVersion,
+  });
+  if (launch._tag === "Attach") {
+    yield* registerAttachedBackend(launch.target);
+    return;
+  }
+  const backendPort = launch.port;
   yield* logBootstrapInfo(
-    backendPortSelection.selectedByScan
-      ? "selected backend port via sequential scan"
-      : "using configured backend port",
-    {
-      port: backendPort,
-      ...(backendPortSelection.selectedByScan ? { startPort: DEFAULT_DESKTOP_BACKEND_PORT } : {}),
-    },
+    Option.isSome(environment.configuredBackendPort)
+      ? "using configured backend port"
+      : "using default backend port",
+    { port: backendPort },
   );
 
   const settings = yield* desktopSettings.get;

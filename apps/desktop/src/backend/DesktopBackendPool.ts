@@ -23,9 +23,10 @@
 //     `setWslDistro(string | null)`; both persist and then call the
 //     orchestrator's reconcile. No swap, no rollback, primary stays up.
 //   - `getLocalEnvironmentBootstraps()` (plural) returns one entry per
-//     pool instance currently registered with bootstrap info. The
-//     primary keeps the "primary" id; WSL instances are "wsl:default"
-//     or "wsl:<distro>".
+//     pool instance currently registered with bootstrap info, plus an
+//     `attached:<environmentId>` entry when Desktop is using an external
+//     same-home owner. The primary keeps the "primary" id; WSL instances
+//     are "wsl:default" or "wsl:<distro>".
 //   - `pickFolder` accepts an optional `targetEnvironmentId`. Omitting
 //     it gives the Windows picker — what every existing caller gets,
 //     and what non-WSL users see. WSL targets route to the wsl helpers.

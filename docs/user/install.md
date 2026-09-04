@@ -49,6 +49,12 @@ Nightly:
 yay -S t3code-nightly-bin
 ```
 
+If a healthy T3 Code server of the exact same version is already using the desktop app's data
+directory, opening the desktop app attaches to that server instead of starting a second backend.
+The app reports a startup error when the existing owner cannot be attached safely, such as when
+its version differs or its endpoint is unreachable. When there is no live same-home owner, the app
+also refuses to start if port 3773 belongs to another process.
+
 ### Windows Subsystem for Linux
 
 When the desktop app runs a WSL backend, it installs the matching server runtime into

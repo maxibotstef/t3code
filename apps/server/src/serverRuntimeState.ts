@@ -1,5 +1,8 @@
+import { PersistedServerAttachCredential, PersistedServerRuntimeState } from "@t3tools/contracts";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -8,18 +11,7 @@ import { writeFileStringAtomically } from "./atomicWrite.ts";
 import type * as ServerConfig from "./config.ts";
 import { formatHostForUrl, isWildcardHost } from "./startupAccess.ts";
 
-export const PersistedServerRuntimeState = Schema.Struct({
-  version: Schema.Literal(1),
-  pid: Schema.Int,
-  host: Schema.optional(Schema.String),
-  port: Schema.Int,
-  origin: Schema.String,
-  // Present when the server fronts a dev web server (VITE_DEV_SERVER_URL).
-  // Dev is single-origin: browsers must pair through this URL, not `origin`.
-  devUrl: Schema.optional(Schema.String),
-  startedAt: Schema.String,
-});
-export type PersistedServerRuntimeState = typeof PersistedServerRuntimeState.Type;
+export { PersistedServerAttachCredential, PersistedServerRuntimeState };
 
 export class ServerRuntimeStateError extends Schema.TaggedErrorClass<ServerRuntimeStateError>()(
   "ServerRuntimeStateError",
@@ -36,6 +28,10 @@ export class ServerRuntimeStateError extends Schema.TaggedErrorClass<ServerRunti
 
 const decodePersistedServerRuntimeState = Schema.decodeUnknownEffect(
   Schema.fromJsonString(PersistedServerRuntimeState),
+);
+
+const decodePersistedServerAttachCredential = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(PersistedServerAttachCredential),
 );
 
 const runtimeOriginForConfig = (
@@ -61,6 +57,24 @@ export const makePersistedServerRuntimeState = (input: {
     startedAt: DateTime.formatIso(now),
   }));
 
+export const makePersistedServerAttachCredential = (input: {
+  readonly environmentId: PersistedServerAttachCredential["environmentId"];
+  readonly serverVersion: string;
+  readonly credential: string;
+}): Effect.Effect<PersistedServerAttachCredential> =>
+  Effect.map(DateTime.now, (now) => ({
+    version: 1,
+    environmentId: input.environmentId,
+    serverVersion: input.serverVersion,
+    credential: input.credential,
+    createdAt: DateTime.formatIso(now),
+  }));
+
+export const generateServerAttachCredential = Crypto.Crypto.pipe(
+  Effect.flatMap((crypto) => crypto.randomBytes(24)),
+  Effect.map(Encoding.encodeHex),
+);
+
 export const persistServerRuntimeState = (input: {
   readonly path: string;
   readonly state: PersistedServerRuntimeState;
@@ -68,6 +82,25 @@ export const persistServerRuntimeState = (input: {
   writeFileStringAtomically({
     filePath: input.path,
     contents: `${JSON.stringify(input.state)}\n`,
+  }).pipe(
+    Effect.mapError(
+      (cause) =>
+        new ServerRuntimeStateError({
+          operation: "persist",
+          statePath: input.path,
+          cause,
+        }),
+    ),
+  );
+
+export const persistServerAttachCredential = (input: {
+  readonly path: string;
+  readonly state: PersistedServerAttachCredential;
+}) =>
+  writeFileStringAtomically({
+    filePath: input.path,
+    contents: `${JSON.stringify(input.state)}\n`,
+    mode: 0o600,
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -103,6 +136,8 @@ export const clearPersistedServerRuntimeState = (path: string) =>
       }),
     );
   });
+
+export const clearPersistedServerAttachCredential = clearPersistedServerRuntimeState;
 
 export const readPersistedServerRuntimeState = (path: string) =>
   Effect.gen(function* () {
@@ -152,6 +187,52 @@ export const readPersistedServerRuntimeState = (path: string) =>
             cause: error,
           }),
           Effect.as(Option.none<PersistedServerRuntimeState>()),
+        ),
+    }),
+  );
+
+export const readPersistedServerAttachCredential = (path: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const raw = yield* fs.readFileString(path).pipe(
+      Effect.matchEffect({
+        onFailure: (cause) =>
+          cause.reason._tag === "NotFound"
+            ? Effect.succeed(Option.none<string>())
+            : Effect.fail(
+                new ServerRuntimeStateError({
+                  operation: "read",
+                  statePath: path,
+                  cause,
+                }),
+              ),
+        onSuccess: (contents) => Effect.succeed(Option.some(contents)),
+      }),
+    );
+    if (Option.isNone(raw) || raw.value.trim().length === 0) {
+      return Option.none<PersistedServerAttachCredential>();
+    }
+    return yield* decodePersistedServerAttachCredential(raw.value.trim()).pipe(
+      Effect.map(Option.some),
+      Effect.mapError(
+        (cause) =>
+          new ServerRuntimeStateError({
+            operation: "decode",
+            statePath: path,
+            cause,
+          }),
+      ),
+    );
+  }).pipe(
+    Effect.catchTags({
+      ServerRuntimeStateError: (error) =>
+        Effect.logWarning(error.message).pipe(
+          Effect.annotateLogs({
+            operation: error.operation,
+            statePath: error.statePath,
+            cause: error,
+          }),
+          Effect.as(Option.none<PersistedServerAttachCredential>()),
         ),
     }),
   );

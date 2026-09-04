@@ -5,11 +5,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
@@ -26,6 +28,8 @@ import {
 } from "../serverRuntimeState.ts";
 import {
   DevServerNotProxiableError,
+  makePairServerConfig,
+  mintPairingLink,
   resolveDirectPairingBaseUrl,
   resolveTailscaleLocalTarget,
 } from "./pair.ts";
@@ -112,12 +116,12 @@ const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   );
 
 const testDescriptor = {
-  environmentId: "pair-test-environment",
+  environmentId: EnvironmentId.make("pair-test-environment"),
   label: "pair-test",
   platform: { os: "linux", arch: "x64" },
   serverVersion: "0.0.1",
   capabilities: { repositoryIdentity: true },
-};
+} satisfies ExecutionEnvironmentDescriptor;
 
 const withDescriptorServer = <A, E, R>(run: (origin: string) => Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
@@ -144,6 +148,31 @@ const withDescriptorServer = <A, E, R>(run: (origin: string) => Effect.Effect<A,
   );
 
 describe("t3 pair", () => {
+  it.effect("leaves server-attach.json untouched while minting a pairing link", () => {
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-fence-test-"));
+    const stateDir = NodePath.join(baseDir, "userdata");
+    const attachPath = NodePath.join(stateDir, "server-attach.json");
+    const attachSentinel = '{"sentinel":"pair-must-not-touch"}\n';
+    NodeFS.mkdirSync(stateDir, { recursive: true });
+    NodeFS.writeFileSync(attachPath, attachSentinel, { mode: 0o600 });
+
+    return Effect.gen(function* () {
+      const config = yield* makePairServerConfig({
+        target: {
+          baseDir,
+          variant: "userdata",
+          state: baseState,
+          descriptor: testDescriptor,
+        },
+        logLevel: "Warn",
+      });
+      assert.isUndefined(config.desktopAttachCredential);
+      yield* mintPairingLink({ config, ttl: Option.none(), label: Option.none() });
+
+      assert.equal(NodeFS.readFileSync(attachPath, "utf8"), attachSentinel);
+    }).pipe(Effect.provide(NodeServices.layer));
+  });
+
   it.effect("mints a token and prints a QR pairing URL for a live server", () =>
     withDescriptorServer((origin) =>
       Effect.gen(function* () {

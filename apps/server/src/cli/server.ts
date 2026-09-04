@@ -3,6 +3,7 @@ import { Command, GlobalFlag } from "effect/unstable/cli";
 
 import { ServerConfig, type StartupPresentation } from "../config.ts";
 import { runServer } from "../server.ts";
+import { generateServerAttachCredential } from "../serverRuntimeState.ts";
 import { type CliServerFlags, resolveServerConfig, sharedServerCommandFlags } from "./config.ts";
 
 export const runServerCommand = (
@@ -15,7 +16,10 @@ export const runServerCommand = (
   Effect.gen(function* () {
     const logLevel = yield* GlobalFlag.LogLevel;
     const config = yield* resolveServerConfig(flags, logLevel, options);
-    return yield* runServer.pipe(Effect.provideService(ServerConfig, config));
+    const desktopAttachCredential = yield* generateServerAttachCredential;
+    return yield* runServer.pipe(
+      Effect.provideService(ServerConfig, { ...config, desktopAttachCredential }),
+    );
   });
 
 export const startCommand = Command.make("start", { ...sharedServerCommandFlags }).pipe(

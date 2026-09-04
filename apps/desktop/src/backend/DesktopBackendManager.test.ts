@@ -187,6 +187,50 @@ function makeTestInstance(input: MakeInstanceInput) {
 }
 
 describe("DesktopBackendManager", () => {
+  it.effect("attached-mode teardown is a no-op before the primary ever starts", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let spawnCount = 0;
+        let configResolveCount = 0;
+        let shutdownCount = 0;
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.sync(() => {
+              spawnCount += 1;
+              return makeProcess({
+                kill: () => Effect.die("never-started primary received a process signal"),
+              });
+            }),
+          ),
+        );
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          configResolve: Effect.sync(() => {
+            configResolveCount += 1;
+            return baseConfig;
+          }),
+          onShutdown: Effect.sync(() => {
+            shutdownCount += 1;
+          }),
+        });
+
+        yield* instance.stop();
+
+        assert.equal(spawnCount, 0);
+        assert.equal(configResolveCount, 0);
+        assert.equal(shutdownCount, 0);
+        assert.deepEqual(yield* instance.snapshot, {
+          desiredRunning: false,
+          ready: false,
+          activePid: Option.none(),
+          restartAttempt: 0,
+          restartScheduled: false,
+        });
+      }),
+    ),
+  );
+
   it.effect("spawns the backend with fd3 bootstrap and fd4 telemetry", () =>
     Effect.scoped(
       Effect.gen(function* () {
