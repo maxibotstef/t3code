@@ -2104,7 +2104,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
-    it.effect("expand-full recovers a clean sparse worktree with unreadable state", () =>
+    it.effect("expand-full preserves unreadable state and refuses to certify the sparse tree", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
@@ -2132,22 +2132,28 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           },
         });
         const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
-        yield* fileSystem.writeFileString(
-          pathService.join(
-            pathService.resolve(worktreePath, gitDir),
-            "worktree-materialization.json",
-          ),
-          "{not-json\n",
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        const before = "{not-json\n";
+        yield* fileSystem.writeFileString(statePath, before);
+        const cone = yield* git(worktreePath, ["sparse-checkout", "list"]);
+        const index = yield* git(worktreePath, ["ls-files", "--stage"]);
+
+        const expanded = yield* Effect.result(
+          driver.expandWorktreeMaterializationFull(worktreePath, "recover-unreadable-state"),
         );
 
-        const expanded = yield* driver.expandWorktreeMaterializationFull(
-          worktreePath,
-          "recover-unreadable-state",
+        assert.equal(expanded._tag, "Failure");
+        assert.equal(yield* fileSystem.readFileString(statePath), before);
+        assert.equal(yield* git(worktreePath, ["config", "--bool", "core.sparseCheckout"]), "true");
+        assert.equal(yield* git(worktreePath, ["sparse-checkout", "list"]), cone);
+        assert.equal(yield* git(worktreePath, ["ls-files", "--stage"]), index);
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+          false,
         );
-
-        assert.equal(expanded.effectiveProfileId, "full");
-        assert.equal(expanded.mode, "full");
-        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
       }),
     );
 

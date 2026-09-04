@@ -1972,8 +1972,16 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           "Worktree must be clean before expand-full.",
         );
       }
-      const persistedRead = yield* Effect.exit(readMaterializationState(cwd));
-      const persisted = Exit.isSuccess(persistedRead) ? persistedRead.value : null;
+      const persisted = yield* readMaterializationState(cwd).pipe(
+        Effect.mapError((cause) =>
+          materializationError(
+            "GitVcsDriver.expandWorktreeMaterializationFull",
+            cwd,
+            "Persisted materialization identity is unreadable. Preserve changes in a named commit or operator-approved external copy. Restore the original state from trusted evidence or create a new worktree; expand-full cannot certify unknown identity.",
+            cause,
+          ),
+        ),
+      );
       if (
         persisted?.status === "failed" &&
         [
