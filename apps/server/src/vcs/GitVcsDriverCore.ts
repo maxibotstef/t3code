@@ -1218,60 +1218,57 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       cwd: repoRoot,
       args: ["cat-file", "blob", `${pinnedCommit}:${relativePath}`],
     } as const;
-    const loaded = yield* Effect.exit(
-      Effect.gen(function* () {
-        const child = yield* commandSpawner
-          .spawn(ChildProcess.make("git", commandInput.args, { cwd: repoRoot }))
-          .pipe(
+    return yield* Effect.gen(function* () {
+      const child = yield* commandSpawner
+        .spawn(ChildProcess.make("git", commandInput.args, { cwd: repoRoot }))
+        .pipe(
+          Effect.mapError((cause) =>
+            materializationError(
+              operation,
+              repoRoot,
+              "Failed to read committed blob bytes.",
+              cause,
+            ),
+          ),
+        );
+      const [chunks, , exitCode] = yield* Effect.all(
+        [
+          Stream.runCollect(child.stdout).pipe(
             Effect.mapError((cause) =>
               materializationError(
                 operation,
                 repoRoot,
-                "Failed to read committed blob bytes.",
+                "Failed to collect committed blob bytes.",
                 cause,
               ),
             ),
-          );
-        const [chunks, stderr, exitCode] = yield* Effect.all(
-          [
-            Stream.runCollect(child.stdout).pipe(
-              Effect.mapError((cause) =>
-                materializationError(
-                  operation,
-                  repoRoot,
-                  "Failed to collect committed blob bytes.",
-                  cause,
-                ),
+          ),
+          collectOutput(commandInput, child.stderr, DEFAULT_MAX_OUTPUT_BYTES, false, undefined),
+          child.exitCode.pipe(
+            Effect.mapError((cause) =>
+              materializationError(
+                operation,
+                repoRoot,
+                "Failed to read committed blob exit code.",
+                cause,
               ),
             ),
-            collectOutput(commandInput, child.stderr, DEFAULT_MAX_OUTPUT_BYTES, false, undefined),
-            child.exitCode.pipe(
-              Effect.mapError((cause) =>
-                materializationError(
-                  operation,
-                  repoRoot,
-                  "Failed to read committed blob exit code.",
-                  cause,
-                ),
-              ),
-            ),
-          ],
-          { concurrency: "unbounded" },
-        );
-        if (exitCode !== 0 || stderr.text.length > 0) return null;
-        const arrays = Array.from(chunks);
-        const byteLength = arrays.reduce((total, chunk) => total + chunk.byteLength, 0);
-        if (byteLength > DEFAULT_MAX_OUTPUT_BYTES) return null;
-        const bytes = new Uint8Array(byteLength);
-        let offset = 0;
-        for (const chunk of arrays) {
-          bytes.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        return bytes;
-      }).pipe(Effect.scoped),
-    );
-    return Exit.isSuccess(loaded) ? loaded.value : null;
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (exitCode !== 0) return null;
+      const arrays = Array.from(chunks);
+      const byteLength = arrays.reduce((total, chunk) => total + chunk.byteLength, 0);
+      if (byteLength > DEFAULT_MAX_OUTPUT_BYTES) return null;
+      const bytes = new Uint8Array(byteLength);
+      let offset = 0;
+      for (const chunk of arrays) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    }).pipe(Effect.scoped);
   });
 
   const readMaterializationContract = Effect.fn("readMaterializationContract")(function* (
@@ -1280,14 +1277,16 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   ) {
     let raw: Uint8Array;
     if (pinnedCommit) {
-      const shown = yield* readMaterializationBlobAtCommit(
-        repoRoot,
-        pinnedCommit,
-        WORKTREE_MATERIALIZATION_CONTRACT_PATH,
-        "GitVcsDriver.materialization.readContractAtBase",
+      const shownRead = yield* Effect.exit(
+        readMaterializationBlobAtCommit(
+          repoRoot,
+          pinnedCommit,
+          WORKTREE_MATERIALIZATION_CONTRACT_PATH,
+          "GitVcsDriver.materialization.readContractAtBase",
+        ),
       );
-      if (!shown) return null;
-      raw = shown;
+      if (Exit.isFailure(shownRead) || !shownRead.value) return null;
+      raw = shownRead.value;
     } else {
       const file = yield* Effect.exit(
         fileSystem.readFile(path.join(repoRoot, WORKTREE_MATERIALIZATION_CONTRACT_PATH)),
@@ -1358,12 +1357,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       if (Exit.isSuccess(source)) sourceTaskCardBytes = source.value;
     }
     if (taskCardAtBase.exitCode === 0) {
-      taskCardBytes = yield* readMaterializationBlobAtCommit(
-        repoRoot,
-        pinnedCommit,
-        taskCardPath,
-        "GitVcsDriver.materialization.taskCardBytesAtBase",
+      const taskCardRead = yield* Effect.exit(
+        readMaterializationBlobAtCommit(
+          repoRoot,
+          pinnedCommit,
+          taskCardPath,
+          "GitVcsDriver.materialization.taskCardBytesAtBase",
+        ),
       );
+      taskCardBytes = Exit.isSuccess(taskCardRead) ? taskCardRead.value : null;
       if (
         taskCardBytes &&
         sourceTaskCardBytes &&
@@ -1518,6 +1520,41 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         excludePath,
       ]);
     });
+    const ensureTargetParentContained = Effect.fn("ensureGeneratedTaskCardParentContained")(
+      function* () {
+        if (!state.taskCardGenerated) return;
+        const worktreeRealPath = yield* fileSystem.realPath(worktreePath);
+        const targetParent = path.dirname(targetPath);
+        const isInsideWorktree = (candidate: string) => {
+          const relative = path.relative(worktreeRealPath, candidate);
+          return (
+            relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+          );
+        };
+        let existingParent = worktreePath;
+        for (const component of taskCardPath.split("/").slice(0, -1)) {
+          existingParent = path.join(existingParent, component);
+          if (!(yield* fileSystem.exists(existingParent))) break;
+          const realParent = yield* fileSystem.realPath(existingParent);
+          if (!isInsideWorktree(realParent)) {
+            return yield* materializationError(
+              "GitVcsDriver.materialization.taskCard",
+              worktreePath,
+              "Generated task card parent escapes the worktree through a symbolic link.",
+            );
+          }
+        }
+        yield* fileSystem.makeDirectory(targetParent, { recursive: true });
+        if (!isInsideWorktree(yield* fileSystem.realPath(targetParent))) {
+          return yield* materializationError(
+            "GitVcsDriver.materialization.taskCard",
+            worktreePath,
+            "Generated task card parent escapes the worktree.",
+          );
+        }
+      },
+    );
+    yield* ensureTargetParentContained();
     const target = yield* Effect.exit(fileSystem.readFile(targetPath));
     if (Exit.isSuccess(target)) {
       const identityMatches = state.taskCardGenerated
@@ -1561,7 +1598,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         "Hash-bound task card source changed before materialization.",
       );
     }
-    yield* fileSystem.makeDirectory(path.dirname(targetPath), { recursive: true });
     yield* configureIgnore();
     yield* fileSystem.writeFile(targetPath, source);
   });
@@ -3840,6 +3876,51 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     },
   );
 
+  const completeWorktreeCreation = Effect.fn("completeWorktreeCreation")(function* (
+    input: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0],
+    worktreePath: string,
+    targetBranch: string,
+    materialization?: VcsWorktreeMaterializationState,
+  ) {
+    const hasSubmodules = yield* fileSystem
+      .exists(path.join(worktreePath, ".gitmodules"))
+      .pipe(Effect.orElseSucceed(() => false));
+    if (hasSubmodules) {
+      yield* runGit("GitVcsDriver.createWorktree.updateSubmodules", worktreePath, [
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+      ]).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("worktree submodule checkout failed; submodule paths are empty", {
+            worktreePath,
+            cause,
+          }),
+        ),
+      );
+    }
+
+    if (input.newRefName && input.baseRefName) {
+      const remoteNames = yield* listRemoteNames(input.cwd).pipe(Effect.orElseSucceed(() => []));
+      const parsedBaseRef = parseRemoteRefWithRemoteNames(
+        input.baseRefName,
+        remoteNames.toSorted((left, right) => right.length - left.length),
+      );
+      const baseBranch = parsedBaseRef?.branchName ?? input.baseRefName;
+      yield* runGit("GitVcsDriver.createWorktree.configureBaseRef", input.cwd, [
+        "config",
+        `branch.${input.newRefName}.gh-merge-base`,
+        baseBranch,
+      ]);
+    }
+
+    return {
+      worktree: { path: worktreePath, refName: targetBranch },
+      ...(materialization ? { materialization } : {}),
+    };
+  });
+
   const resolvePinnedWorktreeCommit = Effect.fn("resolvePinnedWorktreeCommit")(function* (
     repoRoot: string,
     refName: string,
@@ -3850,7 +3931,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ["rev-parse", "--verify", `${refName}^{commit}`],
       { allowNonZeroExit: true },
     );
-    if (exact.exitCode === 0) return exact.stdout.trim();
+    if (exact.exitCode === 0) return { commit: exact.stdout.trim(), remoteRef: null };
     const remoteMatches = yield* executeGit(
       "GitVcsDriver.createWorktree.pinRemoteCommit",
       repoRoot,
@@ -3859,7 +3940,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     );
     const matches = remoteMatches.stdout.split(/\r?\n/).filter(Boolean);
     if (remoteMatches.exitCode === 0 && matches.length === 1) {
-      return matches[0]!.split(" ", 1)[0]!;
+      const [commit, fullRef] = matches[0]!.split(" ", 2);
+      return {
+        commit: commit!,
+        remoteRef: fullRef!.replace(/^refs\/remotes\//, ""),
+      };
     }
     return yield* materializationError(
       "GitVcsDriver.createWorktree.pinCommit",
@@ -3873,13 +3958,24 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   )(function* (input) {
     const targetBranch = input.newRefName ?? input.refName;
     const sanitizedBranch = targetBranch.replace(/\//g, "-");
+    const repoName = path.basename(input.cwd);
+    const worktreePath = input.path ?? path.join(worktreesDir, repoName, sanitizedBranch);
+    if (!input.materialization) {
+      const legacyArgs = input.newRefName
+        ? ["worktree", "add", "-b", input.newRefName, worktreePath, input.refName]
+        : ["worktree", "add", worktreePath, input.refName];
+      yield* executeGit("GitVcsDriver.createWorktree", input.cwd, legacyArgs, {
+        fallbackErrorDetail: "git worktree add failed",
+        timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
+      });
+      return yield* completeWorktreeCreation(input, worktreePath, targetBranch);
+    }
     const repoRoot = (yield* runGitStdout("GitVcsDriver.createWorktree.repoRoot", input.cwd, [
       "rev-parse",
       "--show-toplevel",
     ])).trim();
-    const repoName = path.basename(input.cwd);
-    const worktreePath = input.path ?? path.join(worktreesDir, repoName, sanitizedBranch);
-    const pinnedCommit = yield* resolvePinnedWorktreeCommit(repoRoot, input.refName);
+    const pinned = yield* resolvePinnedWorktreeCommit(repoRoot, input.refName);
+    const pinnedCommit = pinned.commit;
     const contract = input.materialization
       ? yield* readMaterializationContract(repoRoot, pinnedCommit)
       : null;
@@ -3902,19 +3998,43 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     });
 
     if (input.newRefName) {
-      const remoteStart = yield* executeGit(
-        "GitVcsDriver.createWorktree.remoteStart",
+      let trackingRef = pinned.remoteRef;
+      if (!trackingRef) {
+        const remoteStart = yield* executeGit(
+          "GitVcsDriver.createWorktree.remoteStart",
+          repoRoot,
+          ["show-ref", "--verify", "--quiet", `refs/remotes/${input.refName}`],
+          { allowNonZeroExit: true },
+        );
+        if (remoteStart.exitCode === 0) trackingRef = input.refName;
+      }
+      const autoSetupMerge = yield* executeGit(
+        "GitVcsDriver.createWorktree.autoSetupMerge",
         repoRoot,
-        ["show-ref", "--verify", "--quiet", `refs/remotes/${input.refName}`],
+        ["config", "--get", "branch.autoSetupMerge"],
         { allowNonZeroExit: true },
       );
-      if (remoteStart.exitCode === 0) {
-        yield* runGit("GitVcsDriver.createWorktree.preserveUpstream", repoRoot, [
-          "branch",
-          "--set-upstream-to",
-          input.refName,
-          input.newRefName,
-        ]);
+      if (trackingRef && autoSetupMerge.stdout.trim() !== "false") {
+        const preserved = yield* Effect.exit(
+          runGit("GitVcsDriver.createWorktree.preserveUpstream", repoRoot, [
+            "branch",
+            "--set-upstream-to",
+            trackingRef,
+            input.newRefName,
+          ]),
+        );
+        if (Exit.isFailure(preserved)) {
+          yield* writeMaterializationState(worktreePath, {
+            ...requestedMaterialization,
+            status: "failed",
+            reason: "upstream-tracking-failed",
+          });
+          return yield* materializationError(
+            "GitVcsDriver.createWorktree",
+            worktreePath,
+            "Worktree branch upstream tracking failed after creation. The never-released worktree was preserved for diagnosis.",
+          );
+        }
       }
     }
 
@@ -4060,12 +4180,26 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
     } else {
       if (yield* sparseCheckoutEnabled(worktreePath)) {
-        yield* runGit(
-          "GitVcsDriver.createWorktree.disableInheritedSparse",
-          worktreePath,
-          ["sparse-checkout", "disable"],
-          { timeoutMs: WORKTREE_ADD_TIMEOUT_MS },
+        const disabled = yield* Effect.exit(
+          runGit(
+            "GitVcsDriver.createWorktree.disableInheritedSparse",
+            worktreePath,
+            ["sparse-checkout", "disable"],
+            { timeoutMs: WORKTREE_ADD_TIMEOUT_MS },
+          ),
         );
+        if (Exit.isFailure(disabled)) {
+          yield* writeMaterializationState(worktreePath, {
+            ...requestedMaterialization,
+            status: "failed",
+            reason: "inherited-sparse-disable-failed",
+          });
+          return yield* materializationError(
+            "GitVcsDriver.createWorktree",
+            worktreePath,
+            "Inherited sparse checkout could not be disabled. The never-released worktree was preserved for diagnosis.",
+          );
+        }
       }
       const fullCheckout = yield* Effect.exit(
         runGit(
@@ -4106,11 +4240,26 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
     }
 
-    const observedHead = (yield* runGitStdout(
-      "GitVcsDriver.createWorktree.verifyHead",
-      worktreePath,
-      ["rev-parse", "--verify", "HEAD^{commit}"],
-    )).trim();
+    const observedHeadRead = yield* Effect.exit(
+      runGitStdout("GitVcsDriver.createWorktree.verifyHead", worktreePath, [
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+      ]),
+    );
+    if (Exit.isFailure(observedHeadRead)) {
+      yield* writeMaterializationState(worktreePath, {
+        ...materialization,
+        status: "failed",
+        reason: "materialized-head-unreadable",
+      });
+      return yield* materializationError(
+        "GitVcsDriver.createWorktree",
+        worktreePath,
+        "Materialized worktree HEAD could not be read. The never-released worktree was preserved for diagnosis.",
+      );
+    }
+    const observedHead = observedHeadRead.value.trim();
     if (observedHead !== pinnedCommit) {
       yield* writeMaterializationState(worktreePath, {
         ...materialization,
@@ -4153,51 +4302,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ),
     );
 
-    // `git worktree add` leaves submodules empty, so a repo that keeps agent
-    // skills, tooling or source in one gets a worktree that is quietly missing
-    // them. Best-effort: the objects are usually already in the parent's
-    // `.git/modules`, but a first-ever clone needs the network, and failing to
-    // populate a submodule must not roll back the caller's thread.
-    const hasSubmodules = yield* fileSystem
-      .exists(path.join(worktreePath, ".gitmodules"))
-      .pipe(Effect.orElseSucceed(() => false));
-    if (hasSubmodules) {
-      yield* runGit("GitVcsDriver.createWorktree.updateSubmodules", worktreePath, [
-        "submodule",
-        "update",
-        "--init",
-        "--recursive",
-      ]).pipe(
-        Effect.catch((cause) =>
-          Effect.logWarning("worktree submodule checkout failed; submodule paths are empty", {
-            worktreePath,
-            cause,
-          }),
-        ),
-      );
-    }
-
-    if (input.newRefName && input.baseRefName) {
-      const remoteNames = yield* listRemoteNames(input.cwd).pipe(Effect.orElseSucceed(() => []));
-      const parsedBaseRef = parseRemoteRefWithRemoteNames(
-        input.baseRefName,
-        remoteNames.toSorted((left, right) => right.length - left.length),
-      );
-      const baseBranch = parsedBaseRef?.branchName ?? input.baseRefName;
-      yield* runGit("GitVcsDriver.createWorktree.configureBaseRef", input.cwd, [
-        "config",
-        `branch.${input.newRefName}.gh-merge-base`,
-        baseBranch,
-      ]);
-    }
-
-    return {
-      worktree: {
-        path: worktreePath,
-        refName: targetBranch,
-      },
-      materialization,
-    };
+    return yield* completeWorktreeCreation(input, worktreePath, targetBranch, materialization);
   });
 
   const fetchPullRequestBranch: GitVcsDriver.GitVcsDriver["Service"]["fetchPullRequestBranch"] =

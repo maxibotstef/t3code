@@ -16,7 +16,11 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { GitCommandError, type ReviewDiffFileContentsInput } from "@t3tools/contracts";
+import {
+  FULL_WORKTREE_MATERIALIZATION_STATE,
+  GitCommandError,
+  type ReviewDiffFileContentsInput,
+} from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
 import { makeGitVcsDriverCore, splitNullSeparatedGitStdoutPaths } from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
@@ -1568,6 +1572,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const cwd = yield* makeTmpDir();
         const remote = yield* makeTmpDir("git-worktree-remote-");
         const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
         yield* git(remote, ["init", "--bare"]);
         yield* git(cwd, ["remote", "add", "origin", remote]);
         yield* git(cwd, ["push", "origin", initialBranch]);
@@ -1585,6 +1590,15 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           refName: `origin/${initialBranch}`,
           newRefName: "feature/remote-tracking",
           baseRefName: initialBranch,
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-TRACK",
+            taskSlug: "remote-tracking",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
         });
 
         assert.equal(
@@ -1599,6 +1613,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const cwd = yield* makeTmpDir();
         const remote = yield* makeTmpDir("git-worktree-dwim-remote-");
         const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
         yield* git(remote, ["init", "--bare"]);
         yield* git(cwd, ["remote", "add", "origin", remote]);
         yield* git(cwd, ["checkout", "-b", "remote-only"]);
@@ -1617,10 +1632,23 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           cwd,
           path: worktreePath,
           refName: "remote-only",
+          newRefName: "feature/remote-only-materialized",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-DWIM",
+            taskSlug: "remote-only",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
         });
 
-        assert.equal(created.worktree.refName, "remote-only");
-        assert.equal(yield* git(worktreePath, ["branch", "--show-current"]), "remote-only");
+        assert.equal(created.worktree.refName, "feature/remote-only-materialized");
+        assert.equal(
+          yield* git(worktreePath, ["branch", "--show-current"]),
+          "feature/remote-only-materialized",
+        );
         assert.equal(
           yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
           "origin/remote-only",
@@ -1632,6 +1660,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
         const pathService = yield* Path.Path;
         const projectCwd = pathService.join(cwd, "nested-project");
         const fileSystem = yield* FileSystem.FileSystem;
@@ -1652,10 +1681,48 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("keeps omitted materialization on the legacy stateless create path", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "legacy-stateless",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/legacy-stateless",
+        });
+
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        assert.equal(created.materialization, undefined);
+        assert.equal(
+          yield* fileSystem.exists(
+            pathService.join(
+              pathService.resolve(worktreePath, gitDir),
+              "worktree-materialization.json",
+            ),
+          ),
+          false,
+        );
+        assert.deepStrictEqual(
+          yield* driver.verifyWorktreeMaterialization(worktreePath),
+          FULL_WORKTREE_MATERIALIZATION_STATE,
+        );
+      }),
+    );
+
     it.effect("disables inherited sparse configuration for an ordinary full worktree", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
         yield* git(cwd, ["config", "core.sparseCheckout", "true"]);
         const pathService = yield* Path.Path;
         const worktreePath = pathService.join(
@@ -1669,6 +1736,15 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           path: worktreePath,
           refName: initialBranch,
           newRefName: "feature/inherited-sparse-full",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-INHERITED",
+            taskSlug: "inherited-sparse",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
         });
 
         assert.equal(created.materialization?.effectiveProfileId, "full");
@@ -2429,6 +2505,55 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect(
+      "falls back to full before a generated card can escape through a symlinked parent",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+          const pathService = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const outside = yield* makeTmpDir("generated-card-outside-");
+          const outsideCard = pathService.join(outside, "stef-task.json");
+          const taskCardBytes = '{"issue":{"id":"OC-SYMLINK"}}\n';
+          yield* fileSystem.writeFileString(outsideCard, taskCardBytes);
+          yield* fileSystem.symlink(outside, pathService.join(cwd, "ops", "stef-task", "escape"));
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "symlink task card parent"]);
+          const worktreePath = pathService.join(
+            yield* makeTmpDir("git-worktrees-"),
+            "generated-card-parent-symlink",
+          );
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+
+          const created = yield* driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: "feature/generated-card-parent-symlink",
+            materialization: {
+              requestedProfileId: "governance-review",
+              expectedContractSha256,
+              taskId: "OC-SYMLINK",
+              taskSlug: "generated-card-parent-symlink",
+              taskCardPath: "ops/stef-task/escape/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          });
+
+          assert.equal(created.materialization?.effectiveProfileId, "full");
+          assert.equal(created.materialization?.reason, "task-card-materialization-failed");
+          assert.equal(
+            created.materialization?.taskCardPath,
+            "ops/stef-task/escape/stef-task.json",
+          );
+          assert.equal(created.materialization?.taskCardSha256, null);
+          assert.equal(yield* fileSystem.readFileString(outsideCard), taskCardBytes);
+        }),
+    );
+
     it.effect("falls back to full when the contract does not cone-cover task cards", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2753,7 +2878,11 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
             yield* fileSystem.exists(pathService.join(sparsePath, "excluded/large.txt")),
             true,
           );
-          assert.equal(full.materialization?.effectiveProfileId, "full");
+          assert.equal(full.materialization, undefined);
+          assert.equal(
+            (yield* driver.verifyWorktreeMaterialization(fullPath)).effectiveProfileId,
+            "full",
+          );
         }
       }),
     );
