@@ -884,36 +884,18 @@ const createTrace2Monitor = Effect.fn("createTrace2Monitor")(function* (
   };
 });
 
-function decodeUtf8ChunkIsValid(
-  decoder: TextDecoder,
-  chunk?: Uint8Array,
-  options?: { readonly stream?: boolean },
-): boolean {
-  try {
-    decoder.decode(chunk, options);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 const collectOutput = Effect.fnUntraced(function* (
   input: Pick<GitVcsDriver.ExecuteGitInput, "operation" | "cwd" | "args">,
   stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
   maxOutputBytes: number,
   appendTruncationMarker: boolean,
   onLine: ((line: string) => Effect.Effect<void, never>) | undefined,
-): Effect.fn.Return<
-  { readonly text: string; readonly truncated: boolean; readonly invalidUtf8: boolean },
-  GitCommandError
-> {
+): Effect.fn.Return<{ readonly text: string; readonly truncated: boolean }, GitCommandError> {
   const decoder = new TextDecoder();
-  const utf8Validator = new TextDecoder("utf-8", { fatal: true });
   let bytes = 0;
   let text = "";
   let lineBuffer = "";
   let truncated = false;
-  let invalidUtf8 = false;
 
   const emitCompleteLines = Effect.fnUntraced(function* (flush: boolean) {
     let newlineIndex = lineBuffer.indexOf("\n");
@@ -956,12 +938,6 @@ const collectOutput = Effect.fnUntraced(function* (
     truncated = appendTruncationMarker && nextBytes > maxOutputBytes;
 
     const decoded = decoder.decode(chunkToDecode, { stream: !truncated });
-    if (
-      !invalidUtf8 &&
-      !decodeUtf8ChunkIsValid(utf8Validator, chunkToDecode, { stream: !truncated })
-    ) {
-      invalidUtf8 = true;
-    }
     text += decoded;
     lineBuffer += decoded;
     yield* emitCompleteLines(false);
@@ -979,16 +955,12 @@ const collectOutput = Effect.fnUntraced(function* (
   );
 
   const remainder = truncated ? "" : decoder.decode();
-  if (!truncated && !invalidUtf8 && !decodeUtf8ChunkIsValid(utf8Validator)) {
-    invalidUtf8 = true;
-  }
   text += remainder;
   lineBuffer += remainder;
   yield* emitCompleteLines(true);
   return {
     text,
     truncated,
-    invalidUtf8,
   };
 });
 
@@ -1103,8 +1075,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           stderr: stderr.text,
           stdoutTruncated: stdout.truncated,
           stderrTruncated: stderr.truncated,
-          stdoutInvalidUtf8: stdout.invalidUtf8,
-          stderrInvalidUtf8: stderr.invalidUtf8,
         } satisfies GitVcsDriver.ExecuteGitResult;
       });
 
@@ -1243,17 +1213,65 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     relativePath: string,
     operation: string,
   ) {
-    const shown = yield* Effect.exit(
-      executeGit(operation, repoRoot, ["show", `${pinnedCommit}:${relativePath}`]),
+    const commandInput = {
+      operation,
+      cwd: repoRoot,
+      args: ["cat-file", "blob", `${pinnedCommit}:${relativePath}`],
+    } as const;
+    const loaded = yield* Effect.exit(
+      Effect.gen(function* () {
+        const child = yield* commandSpawner
+          .spawn(ChildProcess.make("git", commandInput.args, { cwd: repoRoot }))
+          .pipe(
+            Effect.mapError((cause) =>
+              materializationError(
+                operation,
+                repoRoot,
+                "Failed to read committed blob bytes.",
+                cause,
+              ),
+            ),
+          );
+        const [chunks, stderr, exitCode] = yield* Effect.all(
+          [
+            Stream.runCollect(child.stdout).pipe(
+              Effect.mapError((cause) =>
+                materializationError(
+                  operation,
+                  repoRoot,
+                  "Failed to collect committed blob bytes.",
+                  cause,
+                ),
+              ),
+            ),
+            collectOutput(commandInput, child.stderr, DEFAULT_MAX_OUTPUT_BYTES, false, undefined),
+            child.exitCode.pipe(
+              Effect.mapError((cause) =>
+                materializationError(
+                  operation,
+                  repoRoot,
+                  "Failed to read committed blob exit code.",
+                  cause,
+                ),
+              ),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+        if (exitCode !== 0 || stderr.text.length > 0) return null;
+        const arrays = Array.from(chunks);
+        const byteLength = arrays.reduce((total, chunk) => total + chunk.byteLength, 0);
+        if (byteLength > DEFAULT_MAX_OUTPUT_BYTES) return null;
+        const bytes = new Uint8Array(byteLength);
+        let offset = 0;
+        for (const chunk of arrays) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return bytes;
+      }).pipe(Effect.scoped),
     );
-    if (
-      Exit.isFailure(shown) ||
-      shown.value.stdoutTruncated ||
-      shown.value.stdoutInvalidUtf8 === true
-    ) {
-      return null;
-    }
-    return new TextEncoder().encode(shown.value.stdout);
+    return Exit.isSuccess(loaded) ? loaded.value : null;
   });
 
   const readMaterializationContract = Effect.fn("readMaterializationContract")(function* (
@@ -1887,7 +1905,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           "Worktree must be clean before expand-full.",
         );
       }
-      const persisted = yield* readMaterializationState(cwd);
+      const persistedRead = yield* Effect.exit(readMaterializationState(cwd));
+      const persisted = Exit.isSuccess(persistedRead) ? persistedRead.value : null;
       if (persisted && !(yield* taskCardIdentityMatches(cwd, persisted))) {
         return yield* materializationError(
           "GitVcsDriver.expandWorktreeMaterializationFull",
@@ -3821,6 +3840,34 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     },
   );
 
+  const resolvePinnedWorktreeCommit = Effect.fn("resolvePinnedWorktreeCommit")(function* (
+    repoRoot: string,
+    refName: string,
+  ) {
+    const exact = yield* executeGit(
+      "GitVcsDriver.createWorktree.pinCommit",
+      repoRoot,
+      ["rev-parse", "--verify", `${refName}^{commit}`],
+      { allowNonZeroExit: true },
+    );
+    if (exact.exitCode === 0) return exact.stdout.trim();
+    const remoteMatches = yield* executeGit(
+      "GitVcsDriver.createWorktree.pinRemoteCommit",
+      repoRoot,
+      ["for-each-ref", "--format=%(objectname) %(refname)", `refs/remotes/*/${refName}`],
+      { allowNonZeroExit: true },
+    );
+    const matches = remoteMatches.stdout.split(/\r?\n/).filter(Boolean);
+    if (remoteMatches.exitCode === 0 && matches.length === 1) {
+      return matches[0]!.split(" ", 1)[0]!;
+    }
+    return yield* materializationError(
+      "GitVcsDriver.createWorktree.pinCommit",
+      repoRoot,
+      `Cannot resolve '${refName}' to one source commit.`,
+    );
+  });
+
   const createWorktree: GitVcsDriver.GitVcsDriver["Service"]["createWorktree"] = Effect.fn(
     "createWorktree",
   )(function* (input) {
@@ -3830,13 +3877,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       "rev-parse",
       "--show-toplevel",
     ])).trim();
-    const repoName = path.basename(repoRoot);
+    const repoName = path.basename(input.cwd);
     const worktreePath = input.path ?? path.join(worktreesDir, repoName, sanitizedBranch);
-    const pinnedCommit = (yield* runGitStdout("GitVcsDriver.createWorktree.pinCommit", repoRoot, [
-      "rev-parse",
-      "--verify",
-      `${input.refName}^{commit}`,
-    ])).trim();
+    const pinnedCommit = yield* resolvePinnedWorktreeCommit(repoRoot, input.refName);
     const contract = input.materialization
       ? yield* readMaterializationContract(repoRoot, pinnedCommit)
       : null;

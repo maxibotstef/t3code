@@ -141,6 +141,7 @@ const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(fun
     readonly invalidSharedPath?: boolean;
     readonly invalidSharedValue?: unknown;
     readonly omitTaskCardCone?: boolean;
+    readonly utf8Bom?: boolean;
   } = {},
 ) {
   const contract = {
@@ -187,7 +188,7 @@ const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(fun
     ],
   } as const;
   // @effect-diagnostics-next-line preferSchemaOverJson:off
-  const raw = `${JSON.stringify(contract, null, 2)}\n`;
+  const raw = `${options.utf8Bom ? "\uFEFF" : ""}${JSON.stringify(contract, null, 2)}\n`;
   yield* writeTextFile(cwd, "config/worktree-materialization-profiles.json", raw);
   yield* writeTextFile(cwd, "docs/spec.md", "# sparse\n");
   yield* writeTextFile(cwd, "ops/stef-task/task/stef-task.json", "{}\n");
@@ -1593,6 +1594,64 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("pins the one matching remote branch before legacy DWIM worktree creation", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-dwim-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["checkout", "-b", "remote-only"]);
+        yield* git(cwd, ["push", "origin", "remote-only"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* git(cwd, ["branch", "-D", "remote-only"]);
+        yield* git(cwd, ["fetch", "origin"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "remote-only-dwim",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: "remote-only",
+        });
+
+        assert.equal(created.worktree.refName, "remote-only");
+        assert.equal(yield* git(worktreePath, ["branch", "--show-current"]), "remote-only");
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          "origin/remote-only",
+        );
+      }),
+    );
+
+    it.effect("keeps default worktree placement named after a project subdirectory", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const projectCwd = pathService.join(cwd, "nested-project");
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* fileSystem.makeDirectory(projectCwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd: projectCwd,
+          path: null,
+          refName: initialBranch,
+          newRefName: "feature/nested-project-placement",
+        });
+
+        assert.equal(
+          pathService.basename(pathService.dirname(created.worktree.path)),
+          "nested-project",
+        );
+      }),
+    );
+
     it.effect("disables inherited sparse configuration for an ordinary full worktree", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -1734,6 +1793,53 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           yield* fileSystem.exists(pathService.join(sparsePath, "excluded/large.txt")),
           true,
         );
+      }),
+    );
+
+    it.effect("expand-full recovers a clean sparse worktree with unreadable state", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "unreadable-state-recovery",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/unreadable-state-recovery",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-STATE",
+            taskSlug: "unreadable-state",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        yield* fileSystem.writeFileString(
+          pathService.join(
+            pathService.resolve(worktreePath, gitDir),
+            "worktree-materialization.json",
+          ),
+          "{not-json\n",
+        );
+
+        const expanded = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "recover-unreadable-state",
+        );
+
+        assert.equal(expanded.effectiveProfileId, "full");
+        assert.equal(expanded.mode, "full");
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
       }),
     );
 
@@ -2215,6 +2321,41 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         );
         assert.equal(expanded.taskCardSha256, created.materialization?.taskCardSha256);
         assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("hashes the exact committed UTF-8 BOM bytes", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          utf8Bom: true,
+        });
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "bom-materialization",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/bom-materialization",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-BOM",
+            taskSlug: "bom",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.equal(created.materialization?.contractSha256, expectedContractSha256);
       }),
     );
 

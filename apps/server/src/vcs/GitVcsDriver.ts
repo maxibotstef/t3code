@@ -58,8 +58,6 @@ export interface ExecuteGitResult {
   readonly stderr: string;
   readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
-  readonly stdoutInvalidUtf8?: boolean;
-  readonly stderrInvalidUtf8?: boolean;
 }
 
 export interface GitStatusDetails {
