@@ -1,5 +1,9 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import { assert, it, describe } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -233,6 +237,76 @@ const logicalWorkingTreeBytes = (
       });
     return yield* visit(root);
   });
+
+const realCanaryVerifierPaths = (profileId: string): ReadonlyArray<string> =>
+  ({
+    "governance-review": ["scripts/test/worktree-materialization.test.js"],
+    "brandt-source": ["brandt-pattern-recognition/tests/runtime-config-parser.test.js"],
+    "trading-strategy-source": ["trading-hub/lib/futures-symbol-normalizer.test.js"],
+  })[profileId] ?? [];
+
+const runRealCanaryVerifier = (cwd: string, profileId: string) => {
+  const result = NodeChildProcess.spawnSync(
+    process.execPath,
+    ["--test", "--test-reporter=dot", "--", ...realCanaryVerifierPaths(profileId)],
+    {
+      cwd,
+      encoding: "utf8",
+      timeout: 300_000,
+      maxBuffer: 8 * 1024 * 1024,
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key !== "NODE_TEST_CONTEXT"),
+      ),
+    },
+  );
+  return {
+    status: result.status,
+    signal: result.signal ?? null,
+    error: result.error ? String(result.error.message || result.error) : null,
+    stdout: String(result.stdout || ""),
+    stderr: String(result.stderr || ""),
+  };
+};
+
+const realCanaryReviewPackManifest = (cwd: string, scopePath: string) => {
+  const absolutePath = NodePath.join(cwd, scopePath);
+  const diff = NodeChildProcess.spawnSync(
+    "git",
+    ["diff", "--no-index", "--", "/dev/null", absolutePath],
+    {
+      cwd,
+      encoding: "utf8",
+      timeout: 60_000,
+      maxBuffer: 8 * 1024 * 1024,
+    },
+  );
+  if (![0, 1].includes(diff.status ?? -1) || diff.error || diff.signal) {
+    throw new Error(String(diff.stderr || diff.stdout || "review-pack diff failed").trim());
+  }
+  const bytes = NodeFS.readFileSync(absolutePath);
+  const indexEntry = NodeChildProcess.execFileSync(
+    "git",
+    ["ls-files", "--stage", "--", scopePath],
+    { cwd, encoding: "utf8" },
+  ).trim();
+  const normalizedDiff = String(diff.stdout || "")
+    .split(NodePath.resolve(cwd))
+    .join("$ROOT");
+  const digest = (value: string | Uint8Array) =>
+    NodeCrypto.createHash("sha256").update(value).digest("hex");
+  const manifest = {
+    sources: [
+      {
+        path: scopePath,
+        bytes: bytes.length,
+        sha256: digest(bytes),
+        indexEntry,
+      },
+    ],
+    diffSha256: digest(normalizedDiff),
+  };
+  return digest(JSON.stringify(manifest));
+};
 
 it.effect("uses stable diagnostics for every parsed non-repository command", () => {
   const commands: Array<{ readonly args: ReadonlyArray<string>; readonly lcAll?: string }> = [];
@@ -3309,7 +3383,14 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           }
 
           for (const [index, [profileId, scopePath]] of profiles.entries()) {
+            const fullPath = pathService.join(cloneRoot, `full-${index}`);
             const sparsePath = pathService.join(cloneRoot, `sparse-${index}`);
+            const full = yield* driver.createWorktree({
+              cwd: repo,
+              path: fullPath,
+              refName: pinnedCommit,
+              newRefName: `real-canary/${index}/full`,
+            });
             const created = yield* driver.createWorktree({
               cwd: repo,
               path: sparsePath,
@@ -3325,21 +3406,49 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
                 taskClasses: ["source-task"],
               },
             });
+            assert.equal(full.worktree.path, fullPath);
             assert.equal(created.materialization?.effectiveProfileId, profileId);
-            assert.equal(yield* git(sparsePath, ["rev-parse", "HEAD^{tree}"]), fullTree);
+            assert.equal(yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]), fullTree);
+            assert.equal(
+              yield* git(sparsePath, ["rev-parse", "HEAD^{tree}"]),
+              yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]),
+            );
             assert.equal(
               worktreeMaterializationSha256ForTest(yield* git(sparsePath, ["ls-files", "--stage"])),
+              worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-files", "--stage"])),
+            );
+            assert.equal(
+              worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-files", "--stage"])),
               fullIndexHash,
             );
             assert.equal(
-              worktreeMaterializationSha256ForTest(
-                yield* git(sparsePath, ["ls-tree", "-r", "HEAD"]),
-              ),
+              yield* git(sparsePath, ["ls-tree", "-r", "HEAD"]),
+              yield* git(fullPath, ["ls-tree", "-r", "HEAD"]),
+            );
+            assert.equal(
+              worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-tree", "-r", "HEAD"])),
               fullModesHash,
             );
             assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
+            assert.equal(yield* git(fullPath, ["status", "--porcelain=v1"]), "");
+            const fullTwinBytes = yield* logicalWorkingTreeBytes(fullPath);
             const sparseBytes = yield* logicalWorkingTreeBytes(sparsePath);
-            assert.ok(sparseBytes <= fullBytes * 0.5, `${profileId}: ${sparseBytes}/${fullBytes}`);
+            assert.ok(
+              sparseBytes <= fullTwinBytes * 0.5,
+              `${profileId}: ${sparseBytes}/${fullTwinBytes}`,
+            );
+            const fullVerifier = runRealCanaryVerifier(fullPath, profileId);
+            const sparseVerifier = runRealCanaryVerifier(sparsePath, profileId);
+            assert.equal(
+              fullVerifier.status,
+              0,
+              fullVerifier.error || fullVerifier.stderr || fullVerifier.stdout,
+            );
+            assert.deepStrictEqual(sparseVerifier, fullVerifier);
+            assert.equal(
+              realCanaryReviewPackManifest(sparsePath, scopePath),
+              realCanaryReviewPackManifest(fullPath, scopePath),
+            );
             for (const hiddenPath of [taskCardPath, scopePath]) {
               yield* fileSystem.remove(pathService.join(sparsePath, hiddenPath));
               assert.equal(
@@ -3355,6 +3464,8 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
               )).effectiveProfileId,
               "full",
             );
+            assert.equal(yield* logicalWorkingTreeBytes(sparsePath), fullTwinBytes);
+            assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
           }
         }),
       300_000,
