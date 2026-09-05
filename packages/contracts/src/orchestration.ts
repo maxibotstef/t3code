@@ -23,6 +23,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { VcsWorktreeMaterializationRequest, VcsWorktreeMaterializationState } from "./git.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -493,6 +494,7 @@ export const OrchestrationThread = Schema.Struct({
   ),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  materialization: Schema.optional(VcsWorktreeMaterializationState),
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
   createdAt: IsoDateTime,
@@ -571,6 +573,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   ),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  materialization: Schema.optional(VcsWorktreeMaterializationState),
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
   createdAt: IsoDateTime,
@@ -943,6 +946,7 @@ const ThreadTurnStartBootstrapPrepareWorktree = Schema.Struct({
   baseBranch: TrimmedNonEmptyString,
   branch: Schema.optional(TrimmedNonEmptyString),
   startFromOrigin: Schema.optional(Schema.Boolean),
+  materialization: Schema.optional(VcsWorktreeMaterializationRequest),
 });
 
 const ThreadTurnStartBootstrap = Schema.Struct({
@@ -1168,6 +1172,14 @@ const ThreadTitleRegenerationCompleteCommand = Schema.Struct({
   title: Schema.optional(TrimmedNonEmptyString),
 });
 
+const ThreadMaterializationSetCommand = Schema.Struct({
+  type: Schema.Literal("thread.materialization.set"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  materialization: VcsWorktreeMaterializationState,
+  createdAt: IsoDateTime,
+});
+
 const InternalOrchestrationCommand = Schema.Union([
   ThreadAutoSettleCommand,
   ThreadSessionSetCommand,
@@ -1178,6 +1190,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
   ThreadTitleRegenerationCompleteCommand,
+  ThreadMaterializationSetCommand,
 ]);
 export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.Type;
 
@@ -1203,6 +1216,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.unpinned",
   "thread.pin-reordered",
   "thread.meta-updated",
+  "thread.materialization-set",
   "thread.runtime-mode-set",
   "thread.interaction-mode-set",
   "thread.message-sent",
@@ -1269,6 +1283,12 @@ export const ThreadCreatedPayload = Schema.Struct({
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadMaterializationSetPayload = Schema.Struct({
+  threadId: ThreadId,
+  materialization: VcsWorktreeMaterializationState,
   updatedAt: IsoDateTime,
 });
 
@@ -1509,6 +1529,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.created"),
     payload: ThreadCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.materialization-set"),
+    payload: ThreadMaterializationSetPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

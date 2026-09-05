@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
   type ChatAttachment,
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
@@ -636,6 +637,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             interactionMode: event.payload.interactionMode,
             branch: event.payload.branch,
             worktreePath: event.payload.worktreePath,
+            materialization: FULL_WORKTREE_MATERIALIZATION_STATE,
             linkedPullRequest: null,
             latestTurnId: null,
             createdAt: event.payload.createdAt,
@@ -837,6 +839,19 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             ...(event.payload.linkedPullRequest !== undefined
               ? { linkedPullRequest: event.payload.linkedPullRequest }
               : {}),
+            updatedAt: event.payload.updatedAt,
+          });
+          return;
+        }
+
+        case "thread.materialization-set": {
+          const existingRow = yield* projectionThreadRepository.getById({
+            threadId: event.payload.threadId,
+          });
+          if (Option.isNone(existingRow)) return;
+          yield* projectionThreadRepository.upsert({
+            ...existingRow.value,
+            materialization: event.payload.materialization,
             updatedAt: event.payload.updatedAt,
           });
           return;

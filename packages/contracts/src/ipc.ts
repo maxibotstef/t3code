@@ -3,6 +3,8 @@ import type {
   VcsCreateRefResult,
   VcsCreateWorktreeInput,
   VcsCreateWorktreeResult,
+  VcsExpandWorktreeMaterializationInput,
+  VcsExpandWorktreeMaterializationResult,
   VcsInitInput,
   VcsListRefsInput,
   VcsListRefsResult,
@@ -1338,6 +1340,9 @@ export interface EnvironmentApi {
   vcs: {
     listRefs: (input: VcsListRefsInput) => Promise<VcsListRefsResult>;
     createWorktree: (input: VcsCreateWorktreeInput) => Promise<VcsCreateWorktreeResult>;
+    expandWorktreeMaterialization: (
+      input: VcsExpandWorktreeMaterializationInput,
+    ) => Promise<VcsExpandWorktreeMaterializationResult>;
     removeWorktree: (input: VcsRemoveWorktreeInput) => Promise<void>;
     createRef: (input: VcsCreateRefInput) => Promise<VcsCreateRefResult>;
     switchRef: (input: VcsSwitchRefInput) => Promise<VcsSwitchRefResult>;

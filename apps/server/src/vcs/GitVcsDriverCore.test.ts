@@ -1,10 +1,16 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import { assert, it, describe } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
@@ -14,7 +20,11 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { GitCommandError, type ReviewDiffFileContentsInput } from "@t3tools/contracts";
+import {
+  FULL_WORKTREE_MATERIALIZATION_STATE,
+  GitCommandError,
+  type ReviewDiffFileContentsInput,
+} from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
 import { makeGitVcsDriverCore, splitNullSeparatedGitStdoutPaths } from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
@@ -26,6 +36,8 @@ const TestLayer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfigLayer),
   Layer.provideMerge(NodeServices.layer),
 );
+const worktreeMaterializationSha256ForTest = (value: string) =>
+  NodeCrypto.createHash("sha256").update(value).digest("hex");
 
 const makeNonRepositoryHandle = () =>
   ChildProcessSpawner.makeHandle({
@@ -105,6 +117,7 @@ const git = (
       args,
       ...(env ? { env } : {}),
       timeoutMs: 10_000,
+      maxOutputBytes: 32 * 1024 * 1024,
     });
     return result.stdout.trim();
   });
@@ -127,6 +140,173 @@ const initRepoWithCommit = (
     const initialBranch = yield* git(cwd, ["branch", "--show-current"]);
     return { initialBranch };
   });
+
+const writeMaterializationFixture = Effect.fn("writeMaterializationFixture")(function* (
+  cwd: string,
+  options: {
+    readonly requiredOutsideCone?: boolean;
+    readonly requiredMissingEverywhere?: boolean;
+    readonly invalidSharedPath?: boolean;
+    readonly invalidSharedValue?: unknown;
+    readonly omitTaskCardCone?: boolean;
+    readonly utf8Bom?: boolean;
+  } = {},
+) {
+  const contract = {
+    schemaVersion: "clawd.worktree-materialization-profiles.v1",
+    taskContext: {
+      taskCardRoot: "ops/stef-task",
+      buildStateRoot: "ops/build-state",
+      researchRoot: "ops/research",
+    },
+    sharedConePaths:
+      options.invalidSharedValue !== undefined
+        ? ["config", "ops/stef-task", "ops/build-state", options.invalidSharedValue]
+        : options.invalidSharedPath
+          ? ["config", "ops/stef-task", "ops/build-state", "/absolute-cone"]
+          : options.omitTaskCardCone
+            ? ["config", "ops/build-state"]
+            : ["config", "ops/stef-task", "ops/build-state"],
+    sharedRequiredPaths: ["config/worktree-materialization-profiles.json"],
+    unsupportedTaskClasses: ["unclassified", "multi-domain", "live-runtime"],
+    profiles: [
+      { id: "full", mode: "full", conePaths: [], requiredPaths: [] },
+      {
+        id: "governance-review",
+        mode: "sparse",
+        conePaths: ["docs"],
+        requiredPaths: options.requiredMissingEverywhere
+          ? ["missing/never.txt"]
+          : options.requiredOutsideCone
+            ? ["outside/needed.txt"]
+            : [],
+      },
+      {
+        id: "brandt-source",
+        mode: "sparse",
+        conePaths: ["brandt-pattern-recognition"],
+        requiredPaths: ["brandt-pattern-recognition/source.ts"],
+      },
+      {
+        id: "trading-strategy-source",
+        mode: "sparse",
+        conePaths: ["strategies"],
+        requiredPaths: ["strategies/source.ts"],
+      },
+    ],
+  } as const;
+  // @effect-diagnostics-next-line preferSchemaOverJson:off
+  const raw = `${options.utf8Bom ? "\uFEFF" : ""}${JSON.stringify(contract, null, 2)}\n`;
+  yield* writeTextFile(cwd, "config/worktree-materialization-profiles.json", raw);
+  yield* writeTextFile(cwd, "docs/spec.md", "# sparse\n");
+  yield* writeTextFile(cwd, "ops/stef-task/task/stef-task.json", "{}\n");
+  yield* writeTextFile(cwd, "ops/build-state/OC-1/proof.json", "{}\n");
+  yield* writeTextFile(cwd, "outside/needed.txt", "needed\n");
+  yield* writeTextFile(cwd, "brandt-pattern-recognition/source.ts", "export {};\n");
+  yield* writeTextFile(cwd, "strategies/source.ts", "export {};\n");
+  yield* writeTextFile(cwd, "excluded/large.txt", `${"x".repeat(1_000_000)}\n`);
+  yield* git(cwd, ["add", "."]);
+  yield* git(cwd, ["commit", "-m", "materialization fixture"]);
+  return {
+    expectedContractSha256: NodeCrypto.createHash("sha256").update(raw).digest("hex"),
+    expectedTaskCardSha256: NodeCrypto.createHash("sha256").update("{}\n").digest("hex"),
+  };
+});
+
+const logicalWorkingTreeBytes = (
+  root: string,
+): Effect.Effect<number, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const pathService = yield* Path.Path;
+    const visit = (candidate: string): Effect.Effect<number, PlatformError.PlatformError> =>
+      Effect.gen(function* () {
+        if (Option.isSome(yield* fileSystem.readLink(candidate).pipe(Effect.option))) return 0;
+        const infoOption = yield* fileSystem.stat(candidate).pipe(Effect.option);
+        if (Option.isNone(infoOption)) return 0;
+        const info = infoOption.value;
+        if (info.type === "File") return Number(info.size);
+        if (info.type !== "Directory") return 0;
+        const names = yield* fileSystem.readDirectory(candidate);
+        let total = 0;
+        for (const name of names) {
+          if (candidate === root && name === ".git") continue;
+          total += yield* visit(pathService.join(candidate, name));
+        }
+        return total;
+      });
+    return yield* visit(root);
+  });
+
+const realCanaryVerifierPaths = (profileId: string): ReadonlyArray<string> =>
+  ({
+    "governance-review": ["scripts/test/worktree-materialization.test.js"],
+    "brandt-source": ["brandt-pattern-recognition/tests/runtime-config-parser.test.js"],
+    "trading-strategy-source": ["trading-hub/lib/futures-symbol-normalizer.test.js"],
+  })[profileId] ?? [];
+
+const runRealCanaryVerifier = (cwd: string, profileId: string) => {
+  const result = NodeChildProcess.spawnSync(
+    process.execPath,
+    ["--test", "--test-reporter=dot", "--", ...realCanaryVerifierPaths(profileId)],
+    {
+      cwd,
+      encoding: "utf8",
+      timeout: 300_000,
+      maxBuffer: 8 * 1024 * 1024,
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key !== "NODE_TEST_CONTEXT"),
+      ),
+    },
+  );
+  return {
+    status: result.status,
+    signal: result.signal ?? null,
+    error: result.error ? String(result.error.message || result.error) : null,
+    stdout: String(result.stdout || ""),
+    stderr: String(result.stderr || ""),
+  };
+};
+
+const realCanaryReviewPackManifest = (cwd: string, scopePath: string) => {
+  const absolutePath = NodePath.join(cwd, scopePath);
+  const diff = NodeChildProcess.spawnSync(
+    "git",
+    ["diff", "--no-index", "--", "/dev/null", absolutePath],
+    {
+      cwd,
+      encoding: "utf8",
+      timeout: 60_000,
+      maxBuffer: 8 * 1024 * 1024,
+    },
+  );
+  if (![0, 1].includes(diff.status ?? -1) || diff.error || diff.signal) {
+    throw new Error(String(diff.stderr || diff.stdout || "review-pack diff failed").trim());
+  }
+  const bytes = NodeFS.readFileSync(absolutePath);
+  const indexEntry = NodeChildProcess.execFileSync(
+    "git",
+    ["ls-files", "--stage", "--", scopePath],
+    { cwd, encoding: "utf8" },
+  ).trim();
+  const normalizedDiff = String(diff.stdout || "")
+    .split(NodePath.resolve(cwd))
+    .join("$ROOT");
+  const digest = (value: string | Uint8Array) =>
+    NodeCrypto.createHash("sha256").update(value).digest("hex");
+  const manifest = {
+    sources: [
+      {
+        path: scopePath,
+        bytes: bytes.length,
+        sha256: digest(bytes),
+        indexEntry,
+      },
+    ],
+    diffSha256: digest(normalizedDiff),
+  };
+  return digest(JSON.stringify(manifest));
+};
 
 it.effect("uses stable diagnostics for every parsed non-repository command", () => {
   const commands: Array<{ readonly args: ReadonlyArray<string>; readonly lcAll?: string }> = [];
@@ -1376,6 +1556,2147 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
   });
 
   describe("worktree operations", () => {
+    it.effect(
+      "materializes an explicit hash-bound sparse worktree and expands only while clean",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+          const pathService = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const worktreePath = pathService.join(
+            yield* makeTmpDir("git-worktrees-"),
+            "sparse-materialized",
+          );
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+
+          const created = yield* driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: "feature/sparse-materialized",
+            materialization: {
+              requestedProfileId: "governance-review",
+              expectedContractSha256,
+              taskId: "OC-1",
+              taskSlug: "task",
+              taskCardPath: "ops/stef-task/task/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          });
+
+          if (!created.materialization) return assert.fail("expected materialization state");
+          assert.equal(created.materialization.effectiveProfileId, "governance-review");
+          assert.equal(created.materialization.mode, "sparse");
+          assert.equal(
+            yield* fileSystem.exists(pathService.join(worktreePath, "docs/spec.md")),
+            true,
+          );
+          assert.equal(
+            yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+            false,
+          );
+          assert.equal(yield* git(worktreePath, ["config", "--bool", "index.sparse"]), "false");
+          assert.deepStrictEqual(
+            yield* driver.verifyWorktreeMaterialization(worktreePath),
+            created.materialization,
+          );
+
+          yield* writeTextFile(worktreePath, "dirty.txt", "dirty\n");
+          const dirtyExpansion = yield* Effect.result(
+            driver.expandWorktreeMaterializationFull(worktreePath, "must-refuse"),
+          );
+          assert.equal(dirtyExpansion._tag, "Failure");
+          assert.equal(
+            (yield* driver.verifyWorktreeMaterialization(worktreePath)).effectiveProfileId,
+            "governance-review",
+          );
+          assert.equal(
+            yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+            false,
+          );
+          yield* fileSystem.remove(pathService.join(worktreePath, "dirty.txt"));
+          yield* writeTextFile(worktreePath, "docs/spec.md", "# tracked dirty\n");
+          assert.equal(
+            (yield* Effect.result(
+              driver.expandWorktreeMaterializationFull(worktreePath, "must-refuse-tracked"),
+            ))._tag,
+            "Failure",
+          );
+          assert.equal(
+            yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+            false,
+          );
+          yield* git(worktreePath, ["checkout", "--", "docs/spec.md"]);
+
+          const expanded = yield* driver.expandWorktreeMaterializationFull(
+            worktreePath,
+            "test-expand",
+          );
+          assert.equal(expanded.effectiveProfileId, "full");
+          assert.equal(
+            yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+            true,
+          );
+        }),
+    );
+
+    it.effect("preserves remote-base tracking while pinning the created branch commit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["push", "origin", initialBranch]);
+        yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "true"]);
+        yield* writeTextFile(cwd, "local-only.txt", "local divergence\n");
+        yield* git(cwd, ["add", "local-only.txt"]);
+        yield* git(cwd, ["commit", "-m", "local divergence"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "remote-tracking",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/remote-tracking",
+          baseRefName: initialBranch,
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-TRACK",
+            taskSlug: "remote-tracking",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
+          yield* git(cwd, ["rev-parse", `origin/${initialBranch}^{commit}`]),
+        );
+        assert.notEqual(
+          yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
+          yield* git(cwd, ["rev-parse", `${initialBranch}^{commit}`]),
+        );
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          `origin/${initialBranch}`,
+        );
+      }),
+    );
+
+    it.effect("pins the one matching remote branch before legacy DWIM worktree creation", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-dwim-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["checkout", "-b", "remote-only"]);
+        yield* git(cwd, ["push", "origin", "remote-only"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* git(cwd, ["branch", "-D", "remote-only"]);
+        yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "true"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "remote-only-dwim",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: "remote-only",
+          newRefName: "feature/remote-only-materialized",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-DWIM",
+            taskSlug: "remote-only",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.worktree.refName, "feature/remote-only-materialized");
+        assert.equal(
+          yield* git(worktreePath, ["branch", "--show-current"]),
+          "feature/remote-only-materialized",
+        );
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "HEAD^{commit}"]),
+          yield* git(cwd, ["rev-parse", "origin/remote-only^{commit}"]),
+        );
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          "origin/remote-only",
+        );
+      }),
+    );
+
+    it.effect("refuses ambiguous bare branch names shared by two remotes", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remoteA = yield* makeTmpDir("git-worktree-ambiguous-a-");
+        const remoteB = yield* makeTmpDir("git-worktree-ambiguous-b-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remoteA, ["init", "--bare"]);
+        yield* git(remoteB, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remoteA]);
+        yield* git(cwd, ["remote", "add", "upstream", remoteB]);
+        yield* git(cwd, ["checkout", "-b", "ambiguous"]);
+        yield* git(cwd, ["push", "origin", "ambiguous"]);
+        yield* git(cwd, ["push", "upstream", "ambiguous"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* git(cwd, ["branch", "-D", "ambiguous"]);
+        yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["fetch", "upstream"]);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "ambiguous-remote-branch",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const result = yield* Effect.result(
+          driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: "ambiguous",
+            newRefName: "feature/ambiguous-remote-branch",
+            materialization: {
+              requestedProfileId: "full",
+              expectedContractSha256,
+              taskId: "OC-AMBIGUOUS",
+              taskSlug: "ambiguous-remote-branch",
+              taskCardPath: "ops/stef-task/task/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          }),
+        );
+
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.operation, "GitVcsDriver.createWorktree.pinCommit");
+        }
+        assert.equal(yield* fileSystem.exists(worktreePath), false);
+      }),
+    );
+
+    it.effect("respects simple auto-setup when the local and remote branch names differ", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-simple-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["push", "origin", initialBranch]);
+        yield* git(cwd, ["fetch", "origin"]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "simple"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "simple-auto-setup",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/simple-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-SIMPLE",
+            taskSlug: "simple-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        const upstream = yield* driver.execute({
+          operation: "test.simpleAutoSetup",
+          args: ["rev-parse", "--abbrev-ref", "@{upstream}"],
+          cwd: worktreePath,
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(upstream.exitCode, 0);
+
+        yield* git(cwd, ["config", "branch.autoSetupMerge", ""]);
+        const emptyModePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "empty-auto-setup",
+        );
+        yield* driver.createWorktree({
+          cwd,
+          path: emptyModePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/empty-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-EMPTY",
+            taskSlug: "empty-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const emptyModeUpstream = yield* driver.execute({
+          operation: "test.emptyAutoSetup",
+          args: ["rev-parse", "--abbrev-ref", "@{upstream}"],
+          cwd: emptyModePath,
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(emptyModeUpstream.exitCode, 0);
+
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "off"]);
+        const offModePath = pathService.join(yield* makeTmpDir("git-worktrees-"), "off-auto-setup");
+        yield* driver.createWorktree({
+          cwd,
+          path: offModePath,
+          refName: `origin/${initialBranch}`,
+          newRefName: "feature/off-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-OFF",
+            taskSlug: "off-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const offModeUpstream = yield* driver.execute({
+          operation: "test.offAutoSetup",
+          args: ["rev-parse", "--abbrev-ref", "@{upstream}"],
+          cwd: offModePath,
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(offModeUpstream.exitCode, 0);
+      }),
+    );
+
+    it.effect("inherits the start branch upstream when auto-setup is inherit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-worktree-inherit-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        yield* git(cwd, ["push", "-u", "origin", initialBranch]);
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "inherit"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "inherit-auto-setup",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/inherit-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-INHERIT",
+            taskSlug: "inherit-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(
+          yield* git(worktreePath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          `origin/${initialBranch}`,
+        );
+
+        yield* git(cwd, ["config", "branch.autoSetupMerge", "always"]);
+        const alwaysPath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "always-auto-setup",
+        );
+        yield* driver.createWorktree({
+          cwd,
+          path: alwaysPath,
+          refName: initialBranch,
+          newRefName: "feature/always-auto-setup",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-ALWAYS",
+            taskSlug: "always-auto-setup",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(
+          yield* git(alwaysPath, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+          initialBranch,
+        );
+      }),
+    );
+
+    it.effect("keeps default worktree placement named after a project subdirectory", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const projectCwd = pathService.join(cwd, "nested-project");
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* fileSystem.makeDirectory(projectCwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd: projectCwd,
+          path: null,
+          refName: initialBranch,
+          newRefName: "feature/nested-project-placement",
+        });
+
+        assert.equal(
+          pathService.basename(pathService.dirname(created.worktree.path)),
+          "nested-project",
+        );
+      }),
+    );
+
+    it.effect("keeps omitted materialization on the legacy stateless create path", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "legacy-stateless",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/legacy-stateless",
+        });
+
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        assert.equal(created.materialization, undefined);
+        assert.equal(
+          yield* fileSystem.exists(
+            pathService.join(
+              pathService.resolve(worktreePath, gitDir),
+              "worktree-materialization.json",
+            ),
+          ),
+          false,
+        );
+        assert.deepStrictEqual(
+          yield* driver.verifyWorktreeMaterialization(worktreePath),
+          FULL_WORKTREE_MATERIALIZATION_STATE,
+        );
+      }),
+    );
+
+    it.effect("disables inherited sparse configuration for an ordinary full worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* git(cwd, ["config", "core.sparseCheckout", "true"]);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "inherited-sparse-full",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/inherited-sparse-full",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-INHERITED",
+            taskSlug: "inherited-sparse",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(
+          yield* git(worktreePath, ["config", "--bool", "core.sparseCheckout"]),
+          "false",
+        );
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("falls back to full before release when sparse required paths are absent", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          requiredOutsideCone: true,
+        });
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(yield* makeTmpDir("git-worktrees-"), "full-fallback");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/full-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        if (!created.materialization) return assert.fail("expected fallback materialization state");
+        assert.equal(created.materialization.requestedProfileId, "governance-review");
+        assert.equal(created.materialization.effectiveProfileId, "full");
+        assert.equal(created.materialization.reason, "required-paths-missing");
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "outside/needed.txt")),
+          true,
+        );
+      }),
+    );
+
+    it.effect("expand-full repairs missing and failed sparse identities", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, [
+          "sparse-checkout",
+          "set",
+          "--cone",
+          "--no-sparse-index",
+          "config",
+          "docs",
+        ]);
+        assert.equal(
+          (yield* Effect.result(driver.verifyWorktreeMaterialization(cwd)))._tag,
+          "Failure",
+        );
+        const repairedMissing = yield* driver.expandWorktreeMaterializationFull(
+          cwd,
+          "repair-missing-state",
+        );
+        assert.equal(repairedMissing.status, "ready");
+        assert.equal(repairedMissing.effectiveProfileId, "full");
+        assert.equal((yield* driver.verifyWorktreeMaterialization(cwd)).effectiveProfileId, "full");
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        assert.equal(yield* fileSystem.exists(pathService.join(cwd, "excluded/large.txt")), true);
+
+        const sparsePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "failed-state-repair",
+        );
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: sparsePath,
+          refName: initialBranch,
+          newRefName: "feature/failed-state-repair",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        if (!created.materialization) return assert.fail("expected materialization state");
+        const gitDir = yield* git(sparsePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(sparsePath, gitDir),
+          "worktree-materialization.json",
+        );
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const failedState = JSON.parse(yield* fileSystem.readFileString(statePath));
+        failedState.status = "failed";
+        failedState.reason = "injected-terminal-failure";
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        yield* fileSystem.writeFileString(statePath, `${JSON.stringify(failedState, null, 2)}\n`);
+        assert.equal(
+          (yield* Effect.result(driver.verifyWorktreeMaterialization(sparsePath)))._tag,
+          "Failure",
+        );
+        const repairedFailed = yield* driver.expandWorktreeMaterializationFull(
+          sparsePath,
+          "repair-failed-state",
+        );
+        assert.equal(repairedFailed.status, "ready");
+        assert.equal(repairedFailed.effectiveProfileId, "full");
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(sparsePath, "excluded/large.txt")),
+          true,
+        );
+      }),
+    );
+
+    it.effect("expand-full preserves unreadable state and refuses to certify the sparse tree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "unreadable-state-recovery",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/unreadable-state-recovery",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-STATE",
+            taskSlug: "unreadable-state",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        const before = "{not-json\n";
+        yield* fileSystem.writeFileString(statePath, before);
+        const cone = yield* git(worktreePath, ["sparse-checkout", "list"]);
+        const index = yield* git(worktreePath, ["ls-files", "--stage"]);
+
+        const expanded = yield* Effect.result(
+          driver.expandWorktreeMaterializationFull(worktreePath, "recover-unreadable-state"),
+        );
+
+        assert.equal(expanded._tag, "Failure");
+        assert.equal(yield* fileSystem.readFileString(statePath), before);
+        assert.equal(yield* git(worktreePath, ["config", "--bool", "core.sparseCheckout"]), "true");
+        assert.equal(yield* git(worktreePath, ["sparse-checkout", "list"]), cone);
+        assert.equal(yield* git(worktreePath, ["ls-files", "--stage"]), index);
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+          false,
+        );
+      }),
+    );
+
+    it.effect("expand-full converges after interruption before the atomic state rename", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "interrupted-state-rename",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/interrupted-state-rename",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-INTERRUPT-RENAME",
+            taskSlug: "interrupted-state-rename",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        const before = yield* fileSystem.readFileString(statePath);
+        let failRename = true;
+        const interruptedFileSystem = FileSystem.make({
+          ...fileSystem,
+          rename: (fromPath, toPath) => {
+            if (failRename && toPath === statePath) {
+              failRename = false;
+              return Effect.fail(
+                PlatformError.systemError({
+                  _tag: "Unknown",
+                  module: "FileSystem",
+                  method: "rename",
+                  description: "injected interruption before state rename",
+                }),
+              );
+            }
+            return fileSystem.rename(fromPath, toPath);
+          },
+        });
+        const interruptedDriver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(FileSystem.FileSystem, interruptedFileSystem),
+          Effect.provide(ServerConfigLayer),
+        );
+
+        assert.equal(
+          (yield* Effect.result(
+            interruptedDriver.expandWorktreeMaterializationFull(
+              worktreePath,
+              "interrupted-before-state-rename",
+            ),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(yield* fileSystem.readFileString(statePath), before);
+        assert.equal(
+          yield* git(worktreePath, ["config", "--bool", "core.sparseCheckout"]),
+          "false",
+        );
+        assert.equal(
+          (yield* Effect.result(driver.verifyWorktreeMaterialization(worktreePath)))._tag,
+          "Failure",
+        );
+
+        const retried = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "retry-after-state-rename-interruption",
+        );
+        assert.equal(retried.effectiveProfileId, "full");
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("expand-full leaves a recoverable full state when verification is interrupted", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "interrupted-verification",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/interrupted-verification",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-INTERRUPT-VERIFY",
+            taskSlug: "interrupted-verification",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        let stateRenamed = false;
+        let failRead = true;
+        const interruptedFileSystem = FileSystem.make({
+          ...fileSystem,
+          rename: (fromPath, toPath) =>
+            fileSystem.rename(fromPath, toPath).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (toPath === statePath) stateRenamed = true;
+                }),
+              ),
+            ),
+          readFile: (filePath: string) => {
+            if (stateRenamed && failRead && filePath === statePath) {
+              failRead = false;
+              return Effect.fail(
+                PlatformError.systemError({
+                  _tag: "Unknown",
+                  module: "FileSystem",
+                  method: "readFile",
+                  description: "injected interruption before verification",
+                }),
+              );
+            }
+            return fileSystem.readFile(filePath);
+          },
+        });
+        const interruptedDriver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(FileSystem.FileSystem, interruptedFileSystem),
+          Effect.provide(ServerConfigLayer),
+        );
+
+        assert.equal(
+          (yield* Effect.result(
+            interruptedDriver.expandWorktreeMaterializationFull(
+              worktreePath,
+              "interrupted-before-verification",
+            ),
+          ))._tag,
+          "Failure",
+        );
+        const persisted = yield* driver.verifyWorktreeMaterialization(worktreePath);
+        assert.equal(persisted.effectiveProfileId, "full");
+        const retried = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "retry-after-verification-interruption",
+        );
+        assert.equal(retried.effectiveProfileId, "full");
+      }),
+    );
+
+    it.effect("expand-full refuses failed source identity and branch setup states", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "failed-source-identity",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/failed-source-identity",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-IDENTITY",
+            taskSlug: "failed-source-identity",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const state = JSON.parse(yield* fileSystem.readFileString(statePath));
+        yield* fileSystem.writeFileString(
+          statePath,
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          `${JSON.stringify({ ...state, status: "failed", reason: "materialized-head-mismatch" })}\n`,
+        );
+
+        const expansion = yield* Effect.result(
+          driver.expandWorktreeMaterializationFull(worktreePath, "must-refuse"),
+        );
+
+        assert.equal(expansion._tag, "Failure");
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const preserved = JSON.parse(yield* fileSystem.readFileString(statePath));
+        assert.equal(preserved.status, "failed");
+        assert.equal(preserved.reason, "materialized-head-mismatch");
+      }),
+    );
+
+    it.effect("expand-full repopulates files when sparse config was already disabled", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "disabled-sparse-config",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/disabled-sparse-config",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+          false,
+        );
+        yield* git(worktreePath, ["config", "--worktree", "core.sparseCheckout", "false"]);
+        assert.equal(
+          (yield* Effect.result(driver.verifyWorktreeMaterialization(worktreePath)))._tag,
+          "Failure",
+        );
+        const expanded = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "recover-disabled-sparse-config",
+        );
+        assert.equal(expanded.effectiveProfileId, "full");
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+          true,
+        );
+      }),
+    );
+
+    it.effect("falls back to full when an explicit sparse request has no task class", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "unclassified-fallback",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/unclassified-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/new-file.md"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "unsupported:unclassified");
+      }),
+    );
+
+    it.effect("falls back to full for an unknown task-class token", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "unknown-class"),
+          refName: initialBranch,
+          newRefName: "feature/unknown-class",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["srouce-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "unsupported:srouce-task");
+      }),
+    );
+
+    it.effect("falls back to full when the exact task card is absent at the pinned commit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "missing-task-card"),
+          refName: initialBranch,
+          newRefName: "feature/missing-task-card",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/not-at-base/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "task-card-missing-at-base");
+      }),
+    );
+
+    it.effect("carries a hash-bound generated task card into the sparse worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const taskCardPath = "ops/stef-task/generated/stef-task.json";
+        const taskCardBytes = '{"issue":{"id":"OC-GENERATED"}}\n';
+        yield* writeTextFile(cwd, taskCardPath, taskCardBytes);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const inheritedExcludePath = pathService.join(
+          yield* makeTmpDir("git-global-excludes-"),
+          "global-excludes",
+        );
+        yield* fileSystem.writeFileString(inheritedExcludePath, "*.local-only\n");
+        yield* git(cwd, ["config", "core.excludesFile", inheritedExcludePath]);
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-task-card",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-task-card",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-GENERATED",
+            taskSlug: "generated",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.match(created.materialization?.taskCardSha256 ?? "", /^[a-f0-9]{64}$/);
+        assert.equal(
+          yield* fileSystem.readFileString(pathService.join(worktreePath, taskCardPath)),
+          taskCardBytes,
+        );
+        assert.equal(
+          (yield* driver.verifyWorktreeMaterialization(worktreePath)).effectiveProfileId,
+          "governance-review",
+        );
+        assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
+        assert.equal(
+          yield* git(cwd, ["config", "--get", "core.excludesFile"]),
+          inheritedExcludePath,
+        );
+        assert.equal(yield* git(cwd, ["config", "--get", "extensions.worktreeConfig"]), "true");
+        const worktreeExcludePath = yield* git(worktreePath, [
+          "config",
+          "--worktree",
+          "--get",
+          "core.excludesFile",
+        ]);
+        assert.notEqual(worktreeExcludePath, inheritedExcludePath);
+        assert.equal(
+          yield* fileSystem.readFileString(worktreeExcludePath),
+          `*.local-only\n${taskCardPath}\n`,
+        );
+        yield* fileSystem.writeFileString(
+          pathService.join(worktreePath, taskCardPath),
+          '{"tampered":true}\n',
+        );
+        assert.equal(
+          (yield* Effect.result(driver.verifyWorktreeMaterialization(worktreePath)))._tag,
+          "Failure",
+        );
+        assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
+        const tamperedExpansion = yield* Effect.result(
+          driver.expandWorktreeMaterializationFull(worktreePath, "must-not-rebind-generated-card"),
+        );
+        assert.equal(tamperedExpansion._tag, "Failure");
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(worktreePath, "excluded/large.txt")),
+          false,
+        );
+        yield* fileSystem.writeFileString(
+          pathService.join(worktreePath, taskCardPath),
+          taskCardBytes,
+        );
+        const expanded = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "restored-generated-card",
+        );
+        assert.equal(expanded.effectiveProfileId, "full");
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("completes full fallback when generated task-card bytes change during checkout", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const taskCardPath = "ops/stef-task/generated-race/stef-task.json";
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const sourcePath = pathService.join(cwd, taskCardPath);
+        yield* writeTextFile(cwd, taskCardPath, '{"issue":{"id":"OC-RACE"}}\n');
+        const gitDir = yield* git(cwd, ["rev-parse", "--git-dir"]);
+        const hookPath = pathService.join(cwd, gitDir, "hooks", "post-checkout");
+        yield* fileSystem.writeFileString(
+          hookPath,
+          `#!/bin/sh\nprintf '%s\\n' '{"issue":{"id":"OC-CHANGED"}}' > '${sourcePath}'\n`,
+        );
+        yield* fileSystem.chmod(hookPath, 0o755);
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-task-card-race",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-task-card-race",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-RACE",
+            taskSlug: "generated-race",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "task-card-materialization-failed");
+        assert.equal(created.materialization?.taskCardPath, null);
+        assert.equal(created.materialization?.taskCardSha256, null);
+        assert.equal(created.materialization?.requiredPaths.includes(taskCardPath), false);
+        assert.equal(yield* fileSystem.exists(pathService.join(worktreePath, taskCardPath)), false);
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("preserves inherited ignores when full fallback revisits a generated task card", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          requiredOutsideCone: true,
+        });
+        const taskCardPath = "ops/stef-task/generated-fallback/stef-task.json";
+        yield* writeTextFile(cwd, taskCardPath, '{"issue":{"id":"OC-FALLBACK"}}\n');
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const inheritedExcludePath = pathService.join(
+          yield* makeTmpDir("git-global-excludes-"),
+          "global-excludes",
+        );
+        yield* fileSystem.writeFileString(inheritedExcludePath, "*.local-only\n");
+        yield* git(cwd, ["config", "core.excludesFile", inheritedExcludePath]);
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-task-card-fallback",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-task-card-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-FALLBACK",
+            taskSlug: "generated-fallback",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "required-paths-missing");
+        const worktreeExcludePath = yield* git(worktreePath, [
+          "config",
+          "--worktree",
+          "--get",
+          "core.excludesFile",
+        ]);
+        assert.equal(
+          yield* fileSystem.readFileString(worktreeExcludePath),
+          `*.local-only\n${taskCardPath}\n`,
+        );
+      }),
+    );
+
+    it.effect("preserves the default XDG Git ignore when adding a generated task card", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const taskCardPath = "ops/stef-task/generated-xdg/stef-task.json";
+        yield* writeTextFile(cwd, taskCardPath, '{"issue":{"id":"OC-XDG"}}\n');
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const xdgRoot = yield* makeTmpDir("git-xdg-config-");
+        const defaultExcludePath = pathService.join(xdgRoot, "git", "ignore");
+        yield* fileSystem.makeDirectory(pathService.dirname(defaultExcludePath), {
+          recursive: true,
+        });
+        yield* fileSystem.writeFileString(defaultExcludePath, "*.xdg-only\n");
+        const emptyGlobalConfig = pathService.join(xdgRoot, "empty-global-config");
+        yield* fileSystem.writeFileString(emptyGlobalConfig, "");
+        const previousXdg = process.env.XDG_CONFIG_HOME;
+        const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+        const previousNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+        process.env.XDG_CONFIG_HOME = xdgRoot;
+        process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
+        process.env.GIT_CONFIG_NOSYSTEM = "1";
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = previousXdg;
+            if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+            else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+            if (previousNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+            else process.env.GIT_CONFIG_NOSYSTEM = previousNoSystem;
+          }),
+        );
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-task-card-xdg",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-task-card-xdg",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-XDG",
+            taskSlug: "generated-xdg",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        const worktreeExcludePath = yield* git(worktreePath, [
+          "config",
+          "--worktree",
+          "--get",
+          "core.excludesFile",
+        ]);
+        assert.notEqual(worktreeExcludePath, defaultExcludePath);
+        assert.equal(yield* fileSystem.readFileString(defaultExcludePath), "*.xdg-only\n");
+        assert.equal(
+          yield* fileSystem.readFileString(worktreeExcludePath),
+          `*.xdg-only\n${taskCardPath}\n`,
+        );
+      }),
+    );
+
+    it.effect("falls back to full when tracked task-card working bytes differ from the base", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        yield* writeTextFile(
+          cwd,
+          "ops/stef-task/task/stef-task.json",
+          '{"issue":{"id":"OC-DIRTY"}}\n',
+        );
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "dirty-task-card"),
+          refName: initialBranch,
+          newRefName: "feature/dirty-task-card",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-DIRTY",
+            taskSlug: "dirty",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "task-card-source-mismatch");
+      }),
+    );
+
+    it.effect("hashes contract bytes from the pinned commit instead of working-tree drift", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const contractPath = pathService.join(cwd, "config/worktree-materialization-profiles.json");
+        const contractRaw = yield* fileSystem.readFileString(contractPath);
+        yield* fileSystem.writeFileString(contractPath, `${contractRaw} \n`);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "pinned-contract"),
+          refName: initialBranch,
+          newRefName: "feature/pinned-contract",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.equal(created.materialization?.contractSha256, expectedContractSha256);
+      }),
+    );
+
+    it.effect("verifies committed materialization bytes with checkout EOL conversion", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256, expectedTaskCardSha256 } =
+          yield* writeMaterializationFixture(cwd);
+        yield* git(cwd, ["config", "core.autocrlf", "true"]);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "autocrlf-materialization",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/autocrlf-materialization",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-EOL",
+            taskSlug: "autocrlf",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.equal(created.materialization?.taskCardSha256, expectedTaskCardSha256);
+        assert.notEqual(
+          NodeCrypto.createHash("sha256")
+            .update(
+              yield* fileSystem.readFile(
+                pathService.join(worktreePath, "ops/stef-task/task/stef-task.json"),
+              ),
+            )
+            .digest("hex"),
+          expectedTaskCardSha256,
+        );
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "sparse");
+        const expanded = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "autocrlf-expand",
+        );
+        assert.equal(expanded.taskCardSha256, created.materialization?.taskCardSha256);
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("hashes the exact committed UTF-8 BOM bytes", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          utf8Bom: true,
+        });
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "bom-materialization",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/bom-materialization",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-BOM",
+            taskSlug: "bom",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.equal(created.materialization?.contractSha256, expectedContractSha256);
+      }),
+    );
+
+    it.effect("drops unsafe task-card paths from ordinary full state", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "unsafe-full-card"),
+          refName: initialBranch,
+          newRefName: "feature/unsafe-full-card",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256: "a".repeat(64),
+            taskId: "OC-FULL",
+            taskSlug: "unsafe-full",
+            taskCardPath: "../../outside.json",
+            scopePaths: ["../../outside.ts"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.taskCardPath, null);
+        assert.deepStrictEqual(created.materialization?.scopePaths, []);
+      }),
+    );
+
+    it.effect("carries a valid generated task card through explicit full materialization", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const taskCardPath = "ops/stef-task/generated-full/stef-task.json";
+        const taskCardBytes = '{"issue":{"id":"OC-FULL-CARD"}}\n';
+        yield* writeTextFile(cwd, taskCardPath, taskCardBytes);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "generated-full-card",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/generated-full-card",
+          materialization: {
+            requestedProfileId: "full",
+            expectedContractSha256,
+            taskId: "OC-FULL-CARD",
+            taskSlug: "generated-full",
+            taskCardPath,
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.taskCardGenerated, true);
+        assert.equal(
+          yield* fileSystem.readFileString(pathService.join(worktreePath, taskCardPath)),
+          taskCardBytes,
+        );
+        assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
+      }),
+    );
+
+    it.effect(
+      "falls back to full before a generated card can escape through a symlinked parent",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+          const pathService = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const outside = yield* makeTmpDir("generated-card-outside-");
+          const outsideCard = pathService.join(outside, "stef-task.json");
+          const taskCardBytes = '{"issue":{"id":"OC-SYMLINK"}}\n';
+          yield* fileSystem.writeFileString(outsideCard, taskCardBytes);
+          yield* fileSystem.symlink(outside, pathService.join(cwd, "ops", "stef-task", "escape"));
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "symlink task card parent"]);
+          const worktreePath = pathService.join(
+            yield* makeTmpDir("git-worktrees-"),
+            "generated-card-parent-symlink",
+          );
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+
+          const created = yield* driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: "feature/generated-card-parent-symlink",
+            materialization: {
+              requestedProfileId: "governance-review",
+              expectedContractSha256,
+              taskId: "OC-SYMLINK",
+              taskSlug: "generated-card-parent-symlink",
+              taskCardPath: "ops/stef-task/escape/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          });
+
+          assert.equal(created.materialization?.effectiveProfileId, "full");
+          assert.equal(created.materialization?.reason, "task-card-materialization-failed");
+          assert.equal(created.materialization?.taskCardPath, null);
+          assert.equal(created.materialization?.taskCardSha256, null);
+          assert.equal(yield* fileSystem.readFileString(outsideCard), taskCardBytes);
+        }),
+    );
+
+    it.effect("falls back to full when the contract does not cone-cover task cards", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          omitTaskCardCone: true,
+        });
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "uncovered-card-root"),
+          refName: initialBranch,
+          newRefName: "feature/uncovered-card-root",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-CONE",
+            taskSlug: "uncovered-card-root",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "contract-unavailable");
+      }),
+    );
+
+    it.effect("forces the schema-valid UI sentinel to full", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "ui-sentinel-fallback",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/ui-sentinel-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "invalid-context",
+            taskSlug: "invalid-context",
+            taskCardPath: "invalid",
+            scopePaths: ["invalid"],
+            taskClasses: ["unclassified"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "unsupported:unclassified");
+      }),
+    );
+
+    it.effect("falls back to full when requested work is outside the selected profile cone", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: pathService.join(yield* makeTmpDir("git-worktrees-"), "outside-profile-cone"),
+          refName: initialBranch,
+          newRefName: "feature/outside-profile-cone",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-CONE",
+            taskSlug: "outside-profile-cone",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["strategies/source.ts"],
+            taskClasses: ["source-task"],
+          },
+        });
+
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "multi-domain");
+      }),
+    );
+
+    it.effect("falls back to full on a mismatched expected contract hash", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "hash-mismatch-fallback",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/hash-mismatch-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256: "0".repeat(64),
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "hash-mismatch");
+      }),
+    );
+
+    it.effect("persists a blocking marker when full fallback cannot satisfy required paths", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          requiredMissingEverywhere: true,
+        });
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "terminal-fallback-failure",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const result = yield* Effect.result(
+          driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: "feature/terminal-fallback-failure",
+            materialization: {
+              requestedProfileId: "governance-review",
+              expectedContractSha256,
+              taskId: "OC-1",
+              taskSlug: "task",
+              taskCardPath: "ops/stef-task/task/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          }),
+        );
+        assert.equal(result._tag, "Failure");
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const failedState = JSON.parse(yield* fileSystem.readFileString(statePath));
+        assert.equal(failedState.status, "failed");
+        assert.equal(
+          failedState.reason,
+          "required-paths-missing:full-fallback-required-paths-missing",
+        );
+        const verification = yield* Effect.result(
+          driver.verifyWorktreeMaterialization(worktreePath),
+        );
+        assert.equal(verification._tag, "Failure");
+      }),
+    );
+
+    it.effect("falls back to full when the repository contract has an invalid shared path", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+          invalidSharedPath: true,
+        });
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "malformed-contract-fallback",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/malformed-contract-fallback",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "full");
+        assert.equal(created.materialization?.reason, "contract-unavailable");
+      }),
+    );
+
+    it.effect("falls back to full for noncanonical or non-string contract paths", () =>
+      Effect.gen(function* () {
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        for (const [index, invalidSharedValue] of ["docs/../x", 123].entries()) {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd, {
+            invalidSharedValue,
+          });
+          const created = yield* driver.createWorktree({
+            cwd,
+            path: pathService.join(
+              yield* makeTmpDir("git-worktrees-"),
+              `invalid-contract-path-${index}`,
+            ),
+            refName: initialBranch,
+            newRefName: `feature/invalid-contract-path-${index}`,
+            materialization: {
+              requestedProfileId: "governance-review",
+              expectedContractSha256,
+              taskId: "OC-1",
+              taskSlug: "task",
+              taskCardPath: "ops/stef-task/task/stef-task.json",
+              scopePaths: ["docs/spec.md"],
+              taskClasses: ["source-task"],
+            },
+          });
+          assert.equal(created.materialization?.effectiveProfileId, "full");
+          assert.equal(created.materialization?.reason, "contract-unavailable");
+        }
+      }),
+    );
+
+    it.effect("keeps future scope paths in the cone when the exact task card is pinned", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(yield* makeTmpDir("git-worktrees-"), "future-paths");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const created = yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/future-paths",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-FUTURE",
+            taskSlug: "future-task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/future-file.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        assert.equal(created.materialization?.effectiveProfileId, "governance-review");
+        assert.equal(created.materialization?.requiredPaths.includes("docs/future-file.md"), false);
+        assert.equal(
+          created.materialization?.declaredDynamicPaths?.includes("docs/future-file.md"),
+          true,
+        );
+      }),
+    );
+
+    it.effect("materialization canary preserves full-index identity for every sparse profile", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const profiles = [
+          ["governance-review", "docs/spec.md"],
+          ["brandt-source", "brandt-pattern-recognition/source.ts"],
+          ["trading-strategy-source", "strategies/source.ts"],
+        ] as const;
+
+        for (const [index, [profileId, scopePath]] of profiles.entries()) {
+          const worktreesRoot = yield* makeTmpDir(`git-canary-${index}-`);
+          const fullPath = pathService.join(worktreesRoot, "full");
+          const sparsePath = pathService.join(worktreesRoot, "sparse");
+          const full = yield* driver.createWorktree({
+            cwd,
+            path: fullPath,
+            refName: initialBranch,
+            newRefName: `canary/${index}/full`,
+          });
+          const sparse = yield* driver.createWorktree({
+            cwd,
+            path: sparsePath,
+            refName: initialBranch,
+            newRefName: `canary/${index}/sparse`,
+            materialization: {
+              requestedProfileId: profileId,
+              expectedContractSha256,
+              taskId: "OC-1",
+              taskSlug: "task",
+              taskCardPath: "ops/stef-task/task/stef-task.json",
+              scopePaths: [scopePath],
+              taskClasses: ["source-task"],
+            },
+          });
+          if (!sparse.materialization) return assert.fail("expected sparse canary identity");
+          assert.equal(sparse.materialization.effectiveProfileId, profileId);
+          assert.equal(
+            yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]),
+            yield* git(sparsePath, ["rev-parse", "HEAD^{tree}"]),
+          );
+          assert.equal(
+            worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-files", "--stage"])),
+            worktreeMaterializationSha256ForTest(yield* git(sparsePath, ["ls-files", "--stage"])),
+          );
+          assert.equal(
+            yield* git(fullPath, ["ls-tree", "-r", "HEAD"]),
+            yield* git(sparsePath, ["ls-tree", "-r", "HEAD"]),
+          );
+          assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
+          const fullBytes = yield* logicalWorkingTreeBytes(fullPath);
+          const sparseBytes = yield* logicalWorkingTreeBytes(sparsePath);
+          assert.ok(sparseBytes <= fullBytes * 0.5, `${profileId}: ${sparseBytes}/${fullBytes}`);
+
+          if (index === 0) {
+            for (const hiddenPath of ["ops/stef-task/task/stef-task.json", scopePath]) {
+              yield* fileSystem.remove(pathService.join(sparsePath, hiddenPath));
+              assert.equal(
+                (yield* Effect.result(driver.verifyWorktreeMaterialization(sparsePath)))._tag,
+                "Failure",
+              );
+              yield* git(sparsePath, ["checkout", "--", hiddenPath]);
+              assert.equal(
+                (yield* driver.verifyWorktreeMaterialization(sparsePath)).effectiveProfileId,
+                profileId,
+              );
+            }
+          }
+
+          const expanded = yield* driver.expandWorktreeMaterializationFull(
+            sparsePath,
+            "canary-expand-full",
+          );
+          assert.equal(expanded.effectiveProfileId, "full");
+          assert.equal(
+            yield* fileSystem.exists(pathService.join(sparsePath, "excluded/large.txt")),
+            true,
+          );
+          assert.equal(full.materialization, undefined);
+          assert.equal(
+            (yield* driver.verifyWorktreeMaterialization(fullPath)).effectiveProfileId,
+            "full",
+          );
+        }
+      }),
+    );
+
+    it.effect.skipIf(process.env.T3_MATERIALIZATION_CANARY_REPO === undefined)(
+      "materialization real-repository canary preserves every frozen profile",
+      () =>
+        Effect.gen(function* () {
+          const sourceRepo = process.env.T3_MATERIALIZATION_CANARY_REPO!;
+          const cloneRoot = yield* makeTmpDir("git-real-canary-");
+          const pathService = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const repo = pathService.join(cloneRoot, "repo");
+          yield* git(cloneRoot, [
+            "clone",
+            "--quiet",
+            "--shared",
+            "--no-checkout",
+            sourceRepo,
+            repo,
+          ]);
+          const pinnedCommit = yield* git(repo, ["rev-parse", "HEAD^{commit}"]);
+          yield* git(repo, [
+            "checkout",
+            pinnedCommit,
+            "--",
+            "config/worktree-materialization-profiles.json",
+          ]);
+          yield* git(repo, ["read-tree", pinnedCommit]);
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          const contractResult = yield* driver.execute({
+            operation: "GitVcsDriver.test.realCanaryContract",
+            cwd: repo,
+            args: ["show", `${pinnedCommit}:config/worktree-materialization-profiles.json`],
+            maxOutputBytes: 1024 * 1024,
+          });
+          const contractRaw = Buffer.from(contractResult.stdout, "utf8");
+          const expectedContractSha256 = NodeCrypto.createHash("sha256")
+            .update(contractRaw)
+            .digest("hex");
+          const taskCardPath = (yield* git(repo, [
+            "ls-tree",
+            "-r",
+            "--name-only",
+            pinnedCommit,
+            "ops/stef-task",
+          ]))
+            .split(/\r?\n/)
+            .find((candidate) => candidate.endsWith("/stef-task.json"));
+          if (!taskCardPath) return assert.fail("real repository needs a tracked task card");
+          const fullTree = yield* git(repo, ["rev-parse", `${pinnedCommit}^{tree}`]);
+          const fullIndexHash = worktreeMaterializationSha256ForTest(
+            yield* git(repo, ["ls-files", "--stage"]),
+          );
+          const fullModesHash = worktreeMaterializationSha256ForTest(
+            yield* git(repo, ["ls-tree", "-r", pinnedCommit]),
+          );
+          const fullBytes = (yield* git(repo, ["ls-tree", "-r", "-l", pinnedCommit]))
+            .split(/\r?\n/)
+            .reduce((total, line) => {
+              const match = line.match(/^\d+\s+\w+\s+[a-f0-9]+\s+(\d+)\t/);
+              return total + Number(match?.[1] ?? 0);
+            }, 0);
+          const allProfiles = [
+            ["governance-review", "builds/task-queue/lib/build-state.js"],
+            ["brandt-source", "brandt-pattern-recognition/runtime-config.js"],
+            ["trading-strategy-source", "cot-data/build-latest-from-index.js"],
+          ] as const;
+          const requestedProfile = process.env.T3_MATERIALIZATION_CANARY_PROFILE;
+          const profiles = requestedProfile
+            ? allProfiles.filter(([profileId]) => profileId === requestedProfile)
+            : allProfiles;
+          if (requestedProfile && profiles.length !== 1) {
+            return assert.fail(`unknown real canary profile: ${requestedProfile}`);
+          }
+
+          for (const [index, [profileId, scopePath]] of profiles.entries()) {
+            const fullPath = pathService.join(cloneRoot, `full-${index}`);
+            const sparsePath = pathService.join(cloneRoot, `sparse-${index}`);
+            const full = yield* driver.createWorktree({
+              cwd: repo,
+              path: fullPath,
+              refName: pinnedCommit,
+              newRefName: `real-canary/${index}/full`,
+            });
+            const created = yield* driver.createWorktree({
+              cwd: repo,
+              path: sparsePath,
+              refName: pinnedCommit,
+              newRefName: `real-canary/${index}/sparse`,
+              materialization: {
+                requestedProfileId: profileId,
+                expectedContractSha256,
+                taskId: `OC-REAL-CANARY-${index + 1}`,
+                taskSlug: `${profileId}-canary`,
+                taskCardPath,
+                scopePaths: [scopePath],
+                taskClasses: ["source-task"],
+              },
+            });
+            assert.equal(full.worktree.path, fullPath);
+            assert.equal(created.materialization?.effectiveProfileId, profileId);
+            const fullTwinTree = yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]);
+            const sparseTree = yield* git(sparsePath, ["rev-parse", "HEAD^{tree}"]);
+            assert.equal(fullTwinTree, fullTree);
+            assert.equal(sparseTree, fullTwinTree);
+            const fullTwinIndexHash = worktreeMaterializationSha256ForTest(
+              yield* git(fullPath, ["ls-files", "--stage"]),
+            );
+            const sparseIndexHash = worktreeMaterializationSha256ForTest(
+              yield* git(sparsePath, ["ls-files", "--stage"]),
+            );
+            assert.equal(sparseIndexHash, fullTwinIndexHash);
+            assert.equal(fullTwinIndexHash, fullIndexHash);
+            const fullTwinModesHash = worktreeMaterializationSha256ForTest(
+              yield* git(fullPath, ["ls-tree", "-r", "HEAD"]),
+            );
+            const sparseModesHash = worktreeMaterializationSha256ForTest(
+              yield* git(sparsePath, ["ls-tree", "-r", "HEAD"]),
+            );
+            assert.equal(sparseModesHash, fullTwinModesHash);
+            assert.equal(fullTwinModesHash, fullModesHash);
+            assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
+            assert.equal(yield* git(fullPath, ["status", "--porcelain=v1"]), "");
+            const fullTwinBytes = yield* logicalWorkingTreeBytes(fullPath);
+            const sparseBytes = yield* logicalWorkingTreeBytes(sparsePath);
+            const reductionPct = Number(
+              (((fullTwinBytes - sparseBytes) / fullTwinBytes) * 100).toFixed(2),
+            );
+            assert.ok(reductionPct >= 50, `${profileId}: ${sparseBytes}/${fullTwinBytes}`);
+            const fullVerifier = runRealCanaryVerifier(fullPath, profileId);
+            const sparseVerifier = runRealCanaryVerifier(sparsePath, profileId);
+            assert.equal(
+              fullVerifier.status,
+              0,
+              fullVerifier.error || fullVerifier.stderr || fullVerifier.stdout,
+            );
+            assert.deepStrictEqual(sparseVerifier, fullVerifier);
+            const verifierOutputSha256 = worktreeMaterializationSha256ForTest(
+              [
+                fullVerifier.status,
+                fullVerifier.signal,
+                fullVerifier.error,
+                fullVerifier.stdout,
+                fullVerifier.stderr,
+              ].join("\0"),
+            );
+            const sparseReviewPackManifestSha256 = realCanaryReviewPackManifest(
+              sparsePath,
+              scopePath,
+            );
+            const fullReviewPackManifestSha256 = realCanaryReviewPackManifest(fullPath, scopePath);
+            assert.equal(sparseReviewPackManifestSha256, fullReviewPackManifestSha256);
+            const negativeControls: Array<{
+              readonly path: string;
+              readonly rejected: boolean;
+              readonly restored: boolean;
+            }> = [];
+            for (const hiddenPath of [taskCardPath, scopePath]) {
+              yield* fileSystem.remove(pathService.join(sparsePath, hiddenPath));
+              const rejected =
+                (yield* Effect.result(driver.verifyWorktreeMaterialization(sparsePath)))._tag ===
+                "Failure";
+              assert.equal(rejected, true);
+              yield* git(sparsePath, ["checkout", "--", hiddenPath]);
+              const restored =
+                (yield* driver.verifyWorktreeMaterialization(sparsePath)).effectiveProfileId ===
+                profileId;
+              assert.equal(restored, true);
+              negativeControls.push({ path: hiddenPath, rejected, restored });
+            }
+            const expanded = yield* driver.expandWorktreeMaterializationFull(
+              sparsePath,
+              "real-canary-expand-full",
+            );
+            assert.equal(expanded.effectiveProfileId, "full");
+            assert.equal(yield* logicalWorkingTreeBytes(sparsePath), fullTwinBytes);
+            assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
+
+            const resultPath = process.env.T3_MATERIALIZATION_CANARY_RESULT_PATH;
+            if (resultPath) {
+              const t3SourceHead = yield* git(process.cwd(), ["rev-parse", "HEAD^{commit}"]);
+              // @effect-diagnostics-next-line preferSchemaOverJson:off
+              const resultJson = JSON.stringify(
+                {
+                  schemaVersion: "t3.materialization-real-canary-result.v1",
+                  ok: true,
+                  t3SourceHead,
+                  clawdSourceHead: pinnedCommit,
+                  profileId,
+                  pinnedCommit,
+                  fullTree,
+                  fullTwinTree,
+                  sparseTree,
+                  fullIndexHash,
+                  fullTwinIndexHash,
+                  sparseIndexHash,
+                  fullModesHash,
+                  fullTwinModesHash,
+                  sparseModesHash,
+                  fullTwinBytes,
+                  sparseBytes,
+                  reductionPct,
+                  requiredPaths: created.materialization?.requiredPaths ?? [],
+                  verifierPaths: realCanaryVerifierPaths(profileId),
+                  verifierOutputSha256,
+                  verifierParity: true,
+                  reviewPackManifestSha256: fullReviewPackManifestSha256,
+                  reviewPackParity: true,
+                  negativeControls,
+                  expansionStatus: expanded.mode,
+                  expansionReason: expanded.reason,
+                  cleanAfterExpansion: true,
+                },
+                null,
+                2,
+              );
+              yield* fileSystem.writeFileString(resultPath, `${resultJson}\n`);
+            }
+          }
+        }),
+      300_000,
+    );
+
     it.effect("preserves newline characters in worktree paths when listing refs", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

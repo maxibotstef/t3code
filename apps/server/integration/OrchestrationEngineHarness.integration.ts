@@ -5,6 +5,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ApprovalRequestId,
   CodexSettings,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
   ProviderDriverKind,
   type OrchestrationEvent,
   type OrchestrationThread,
@@ -332,6 +333,7 @@ export const makeOrchestrationIntegrationHarness = (
         readonly oldBranch: string;
         readonly newBranch: string;
       }) => Effect.succeed({ branch: input.newBranch }),
+      verifyWorktreeMaterialization: () => Effect.succeed(FULL_WORKTREE_MATERIALIZATION_STATE),
     });
     const textGenerationLayer = Layer.succeed(TextGeneration, {
       generateBranchName: () => Effect.succeed({ branch: "update" }),

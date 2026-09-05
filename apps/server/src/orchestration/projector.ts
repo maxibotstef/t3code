@@ -4,6 +4,7 @@ import {
   OrchestrationMessage,
   OrchestrationSession,
   OrchestrationThread,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -18,6 +19,7 @@ import {
   ThreadActivityAppendedPayload,
   ThreadArchivedPayload,
   ThreadCreatedPayload,
+  ThreadMaterializationSetPayload,
   ThreadDeletedPayload,
   ThreadInteractionModeSetPayload,
   ThreadMetaUpdatedPayload,
@@ -326,6 +328,7 @@ export function projectEvent(
             interactionMode: payload.interactionMode,
             branch: payload.branch,
             worktreePath: payload.worktreePath,
+            materialization: FULL_WORKTREE_MATERIALIZATION_STATE,
             latestTurn: null,
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
@@ -352,6 +355,22 @@ export function projectEvent(
             : [...nextBase.threads, thread],
         };
       });
+
+    case "thread.materialization-set":
+      return decodeForEvent(
+        ThreadMaterializationSetPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            materialization: payload.materialization,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
 
     case "thread.deleted":
       return decodeForEvent(ThreadDeletedPayload, event.payload, event.type, "payload").pipe(

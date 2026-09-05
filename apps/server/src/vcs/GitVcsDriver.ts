@@ -18,6 +18,7 @@ import {
   type VcsCreateRefResult,
   type VcsCreateWorktreeInput,
   type VcsCreateWorktreeResult,
+  type VcsWorktreeMaterializationState,
   type ReviewDiffPreviewInput,
   type ReviewDiffPreviewResult,
   type ReviewDiffFileContentsInput,
@@ -281,6 +282,13 @@ export class GitVcsDriver extends Context.Service<
     readonly createWorktree: (
       input: VcsCreateWorktreeInput,
     ) => Effect.Effect<VcsCreateWorktreeResult, GitCommandError>;
+    readonly verifyWorktreeMaterialization: (
+      cwd: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
+    readonly expandWorktreeMaterializationFull: (
+      cwd: string,
+      reason: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
     readonly fetchPullRequestBranch: (
       input: GitFetchPullRequestBranchInput,
     ) => Effect.Effect<void, GitCommandError>;

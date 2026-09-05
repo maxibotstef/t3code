@@ -11,6 +11,7 @@ import {
   type VcsCreateRefResult,
   type VcsCreateWorktreeInput,
   type VcsCreateWorktreeResult,
+  type VcsWorktreeMaterializationState,
   type VcsListRefsInput,
   type VcsListRefsResult,
   type GitManagerServiceError,
@@ -65,6 +66,13 @@ export class GitWorkflowService extends Context.Service<
     readonly createWorktree: (
       input: VcsCreateWorktreeInput,
     ) => Effect.Effect<VcsCreateWorktreeResult, GitCommandError>;
+    readonly verifyWorktreeMaterialization: (
+      cwd: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
+    readonly expandWorktreeMaterializationFull: (
+      cwd: string,
+      reason: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
     readonly fetchRemote: (input: {
       readonly cwd: string;
       readonly remoteName: string;
@@ -310,6 +318,14 @@ export const make = Effect.gen(function* () {
     createWorktree: (input) =>
       ensureGitCommand("GitWorkflowService.createWorktree", input.cwd).pipe(
         Effect.andThen(git.createWorktree(input)),
+      ),
+    verifyWorktreeMaterialization: (cwd) =>
+      ensureGitCommand("GitWorkflowService.verifyWorktreeMaterialization", cwd).pipe(
+        Effect.andThen(git.verifyWorktreeMaterialization(cwd)),
+      ),
+    expandWorktreeMaterializationFull: (cwd, reason) =>
+      ensureGitCommand("GitWorkflowService.expandWorktreeMaterializationFull", cwd).pipe(
+        Effect.andThen(git.expandWorktreeMaterializationFull(cwd, reason)),
       ),
     fetchRemote: (input) =>
       ensureGitCommand("GitWorkflowService.fetchRemote", input.cwd).pipe(

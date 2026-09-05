@@ -47,6 +47,61 @@ const VcsStatusChangeRequestState = Schema.Literals(["open", "closed", "merged"]
 const GitPullRequestReference = TrimmedNonEmptyStringSchema;
 const GitPullRequestState = Schema.Literals(["open", "closed", "merged"]);
 const GitPreparePullRequestThreadMode = Schema.Literals(["local", "worktree"]);
+const Sha256Hex = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+const GitCommitHex = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40,64}$/));
+
+export const VcsWorktreeMaterializationRequest = Schema.Struct({
+  requestedProfileId: TrimmedNonEmptyStringSchema,
+  expectedContractSha256: Sha256Hex,
+  taskId: TrimmedNonEmptyStringSchema,
+  taskSlug: TrimmedNonEmptyStringSchema,
+  taskCardPath: TrimmedNonEmptyStringSchema,
+  scopePaths: Schema.Array(TrimmedNonEmptyStringSchema).check(Schema.isMinLength(1)),
+  taskClasses: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
+  includeResearchTask: Schema.optional(Schema.Boolean),
+});
+export type VcsWorktreeMaterializationRequest = typeof VcsWorktreeMaterializationRequest.Type;
+
+export const VcsWorktreeMaterializationState = Schema.Struct({
+  status: Schema.optional(Schema.Literals(["ready", "failed"])),
+  requestedProfileId: TrimmedNonEmptyStringSchema,
+  effectiveProfileId: TrimmedNonEmptyStringSchema,
+  mode: Schema.Literals(["full", "sparse"]),
+  reason: Schema.NullOr(Schema.String),
+  expectedContractSha256: Schema.NullOr(Sha256Hex),
+  contractSha256: Schema.NullOr(Sha256Hex),
+  manifestSha256: Schema.NullOr(Sha256Hex),
+  conePaths: Schema.Array(TrimmedNonEmptyStringSchema),
+  requiredPaths: Schema.Array(TrimmedNonEmptyStringSchema),
+  taskId: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  taskSlug: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  taskCardPath: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
+  taskCardSha256: Schema.optional(Schema.NullOr(Sha256Hex)),
+  taskCardGenerated: Schema.optional(Schema.Boolean),
+  baseSha: Schema.optional(Schema.NullOr(GitCommitHex)),
+  scopePaths: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
+  taskClasses: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
+  includeResearchTask: Schema.optional(Schema.Boolean),
+  declaredDynamicPaths: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
+});
+export type VcsWorktreeMaterializationState = typeof VcsWorktreeMaterializationState.Type;
+
+export const FULL_WORKTREE_MATERIALIZATION_STATE: VcsWorktreeMaterializationState = {
+  status: "ready",
+  requestedProfileId: "full",
+  effectiveProfileId: "full",
+  mode: "full",
+  reason: "default-full",
+  expectedContractSha256: null,
+  contractSha256: null,
+  manifestSha256: null,
+  conePaths: [],
+  requiredPaths: [],
+  taskId: null,
+  taskSlug: null,
+  taskCardPath: null,
+  baseSha: null,
+};
 export const GitRunStackedActionToastRunAction = Schema.Struct({
   kind: GitStackedAction,
 });
@@ -141,8 +196,17 @@ export const VcsCreateWorktreeInput = Schema.Struct({
   newRefName: Schema.optional(TrimmedNonEmptyStringSchema),
   baseRefName: Schema.optional(TrimmedNonEmptyStringSchema),
   path: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  materialization: Schema.optional(VcsWorktreeMaterializationRequest),
 });
 export type VcsCreateWorktreeInput = typeof VcsCreateWorktreeInput.Type;
+
+export const VcsExpandWorktreeMaterializationInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  threadId: ThreadId,
+  reason: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type VcsExpandWorktreeMaterializationInput =
+  typeof VcsExpandWorktreeMaterializationInput.Type;
 
 export const GitPullRequestRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
@@ -273,8 +337,15 @@ export type VcsListRefsResult = typeof VcsListRefsResult.Type;
 
 export const VcsCreateWorktreeResult = Schema.Struct({
   worktree: VcsWorktree,
+  materialization: Schema.optional(VcsWorktreeMaterializationState),
 });
 export type VcsCreateWorktreeResult = typeof VcsCreateWorktreeResult.Type;
+
+export const VcsExpandWorktreeMaterializationResult = Schema.Struct({
+  materialization: VcsWorktreeMaterializationState,
+});
+export type VcsExpandWorktreeMaterializationResult =
+  typeof VcsExpandWorktreeMaterializationResult.Type;
 
 export const GitResolvePullRequestResult = Schema.Struct({
   pullRequest: GitResolvedPullRequest,

@@ -42,6 +42,11 @@ import {
   resolveDraftPromotionNavigationTarget,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  buildUiWorktreeMaterializationRequest,
+  resolveMaterializationTaskCardRead,
+  parseWorktreeMaterializationUiContract,
+  resolveUiWorktreeMaterializationRequest,
+  worktreeMaterializationPresentation,
   resolveDraftHeroState,
   scheduleEnvironmentReconnectWarning,
   startNewThreadForProject,
@@ -1166,6 +1171,337 @@ describe("resolveSendEnvMode", () => {
   it("keeps worktree mode only for git repositories", () => {
     expect(resolveSendEnvMode({ requestedEnvMode: "worktree", isGitRepo: true })).toBe("worktree");
     expect(resolveSendEnvMode({ requestedEnvMode: "worktree", isGitRepo: false })).toBe("local");
+  });
+});
+
+describe("worktree materialization selection", () => {
+  it("discovers profile IDs from the repository contract rather than UI constants", () => {
+    const parsed = parseWorktreeMaterializationUiContract(
+      JSON.stringify({
+        schemaVersion: "clawd.worktree-materialization-profiles.v1",
+        profiles: [
+          { id: "full", mode: "full" },
+          { id: "repository-profile", mode: "sparse" },
+        ],
+      }),
+    );
+    expect(parsed?.profiles.map((profile) => profile.id)).toEqual(["full", "repository-profile"]);
+  });
+
+  it("uses only matching structured task-card metadata and never title text", () => {
+    const sha = "a".repeat(64);
+    const request = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        title: "brandt trading governance words are irrelevant",
+        issue: { id: "OC-1" },
+        materialization: {
+          requestedProfileId: "governance-review",
+          expectedContractSha256: sha,
+          taskId: "OC-1",
+          taskSlug: "task",
+          taskCardPath: "ops/stef-task/task/stef-task.json",
+          scopePaths: ["docs/spec.md"],
+          taskClasses: ["source-task"],
+        },
+        verification: {
+          status: "declared",
+          args: { paths: ["scripts/test/materialization.test.js"] },
+        },
+      }),
+    });
+    expect(request?.requestedProfileId).toBe("governance-review");
+    expect(request?.taskCardPath).toBe("ops/stef-task/task/stef-task.json");
+    expect(request?.scopePaths).toEqual(["docs/spec.md", "scripts/test/materialization.test.js"]);
+    expect(
+      resolveUiWorktreeMaterializationRequest({
+        requestedProfileId: "governance-review",
+        contractSha256: sha,
+        taskCardPath: "ops/stef-task/task/stef-task.json",
+        taskCardContents: JSON.stringify({
+          issue: { id: "OC-OTHER" },
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256: sha,
+            taskId: "OC-1",
+            taskSlug: "task",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        }),
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveUiWorktreeMaterializationRequest({
+        requestedProfileId: "brandt-source",
+        contractSha256: sha,
+        taskCardPath: "ops/stef-task/other/stef-task.json",
+        taskCardContents: JSON.stringify({ title: "Brandt source task" }),
+      }),
+    ).toBeUndefined();
+  });
+
+  it("rejects card fields that would fail the wire schema", () => {
+    const sha = "a".repeat(64);
+    expect(
+      resolveUiWorktreeMaterializationRequest({
+        requestedProfileId: "governance-review",
+        contractSha256: sha,
+        taskCardPath: "ops/stef-task/task/stef-task.json",
+        taskCardContents: JSON.stringify({
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256: sha,
+            taskId: "",
+            taskSlug: "task",
+            scopePaths: [123],
+          },
+        }),
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveUiWorktreeMaterializationRequest({
+        requestedProfileId: "governance-review",
+        contractSha256: sha,
+        taskCardPath: "ops/stef-task/task/stef-task.json",
+        taskCardContents: JSON.stringify({
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256: sha,
+            taskId: "OC-1",
+            taskSlug: "task",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+          verification: { status: "declared", args: { paths: [123] } },
+        }),
+      }),
+    ).toBeUndefined();
+  });
+
+  it("reads only declared verifier paths and accepts other typed verifier arguments", () => {
+    const sha = "a".repeat(64);
+    const materialization = {
+      requestedProfileId: "governance-review",
+      expectedContractSha256: sha,
+      taskId: "OC-1",
+      taskSlug: "task",
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+      taskClasses: ["source-task"],
+    };
+    const withArgs = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        issue: { id: "OC-1" },
+        materialization,
+        verification: {
+          status: "declared",
+          args: {
+            paths: ["scripts/test/materialization.test.js"],
+            tags: ["not-a-path"],
+            timeout: 300,
+          },
+        },
+      }),
+    });
+    expect(withArgs?.scopePaths).toEqual(["docs/spec.md", "scripts/test/materialization.test.js"]);
+
+    const withoutArgs = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        issue: { id: "OC-1" },
+        materialization,
+        verification: { status: "declared" },
+      }),
+    });
+    expect(withoutArgs?.scopePaths).toEqual(["docs/spec.md"]);
+
+    const trimmed = resolveUiWorktreeMaterializationRequest({
+      requestedProfileId: "governance-review",
+      contractSha256: sha,
+      taskCardPath: "ops/stef-task/task/stef-task.json",
+      taskCardContents: JSON.stringify({
+        issue: { id: "OC-1" },
+        materialization: {
+          ...materialization,
+          taskId: " OC-1 ",
+          taskSlug: " task ",
+          scopePaths: [" docs/spec.md "],
+          taskClasses: [" source-task "],
+        },
+        verification: {
+          status: "declared",
+          args: { paths: [" scripts/test/materialization.test.js "] },
+        },
+      }),
+    });
+    expect(trimmed).toMatchObject({
+      taskId: "OC-1",
+      taskSlug: "task",
+      scopePaths: ["docs/spec.md", "scripts/test/materialization.test.js"],
+      taskClasses: ["source-task"],
+    });
+  });
+
+  it("waits for a selected card without reusing stale or truncated content", () => {
+    const ready = {
+      enabled: true,
+      requestedProfileId: "governance-review",
+      taskCardPath: "ops/stef-task/new/stef-task.json",
+      debouncedTaskCardPath: "ops/stef-task/new/stef-task.json",
+      isPending: false,
+      isError: false,
+      data: { contents: "card", truncated: false },
+    };
+    expect(resolveMaterializationTaskCardRead(ready)).toEqual({ pending: false, contents: "card" });
+    expect(resolveMaterializationTaskCardRead({ ...ready, isPending: true })).toEqual({
+      pending: true,
+      contents: null,
+    });
+    expect(
+      resolveMaterializationTaskCardRead({
+        ...ready,
+        debouncedTaskCardPath: "ops/stef-task/old/stef-task.json",
+      }),
+    ).toEqual({ pending: true, contents: null });
+    for (const data of [undefined, { contents: "card", truncated: true }]) {
+      expect(resolveMaterializationTaskCardRead({ ...ready, data })).toEqual({
+        pending: false,
+        contents: null,
+      });
+    }
+    const failed = resolveMaterializationTaskCardRead({ ...ready, isError: true });
+    expect(failed).toEqual({ pending: false, contents: null });
+    expect(
+      buildUiWorktreeMaterializationRequest({
+        requestedProfileId: ready.requestedProfileId,
+        contractSha256: "a".repeat(64),
+        taskCardPath: ready.taskCardPath,
+        taskCardContents: failed.contents,
+      })?.taskClasses,
+    ).toEqual(["unclassified"]);
+  });
+
+  it("does not block sending when card reading is disabled, cleared, or full is selected", () => {
+    const pending = {
+      enabled: true,
+      requestedProfileId: "governance-review",
+      taskCardPath: "ops/stef-task/new/stef-task.json",
+      debouncedTaskCardPath: "ops/stef-task/old/stef-task.json",
+      isPending: true,
+      isError: false,
+      data: undefined,
+    };
+    for (const changed of [
+      { enabled: false },
+      { requestedProfileId: "full" },
+      { taskCardPath: " " },
+    ]) {
+      expect(resolveMaterializationTaskCardRead({ ...pending, ...changed })).toEqual({
+        pending: false,
+        contents: null,
+      });
+    }
+  });
+
+  it("builds a schema-valid unclassified sentinel that must fall back full", () => {
+    const sha = "a".repeat(64);
+    expect(
+      buildUiWorktreeMaterializationRequest({
+        requestedProfileId: "governance-review",
+        contractSha256: sha,
+        taskCardPath: "",
+        taskCardContents: null,
+      }),
+    ).toEqual({
+      requestedProfileId: "governance-review",
+      expectedContractSha256: sha,
+      taskId: "invalid-context",
+      taskSlug: "invalid-context",
+      taskCardPath: "invalid",
+      scopePaths: ["invalid"],
+      taskClasses: ["unclassified"],
+    });
+    expect(
+      buildUiWorktreeMaterializationRequest({
+        requestedProfileId: "governance-review",
+        contractSha256: sha,
+        taskCardPath: "ops/stef-task/task/stef-task.json",
+        taskCardContents: JSON.stringify({
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256: "b".repeat(64),
+            taskId: "OC-1",
+            taskSlug: "task",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        }),
+      })?.taskClasses,
+    ).toEqual(["unclassified"]);
+  });
+
+  it("surfaces sparse and requested-to-full effective states", () => {
+    const fullFallback = worktreeMaterializationPresentation({
+      requestedProfileId: "governance-review",
+      effectiveProfileId: "full",
+      mode: "full",
+      reason: "hash-mismatch",
+      expectedContractSha256: null,
+      contractSha256: null,
+      manifestSha256: null,
+      conePaths: [],
+      requiredPaths: [],
+      taskId: null,
+      taskSlug: null,
+    });
+    expect(fullFallback).toEqual({
+      label: "Requested governance-review → full (hash-mismatch)",
+      canExpand: false,
+      fellBack: true,
+    });
+    expect(
+      worktreeMaterializationPresentation({
+        requestedProfileId: "governance-review",
+        effectiveProfileId: "full",
+        mode: "full",
+        reason: "user-expand-full",
+        expectedContractSha256: null,
+        contractSha256: null,
+        manifestSha256: null,
+        conePaths: [],
+        requiredPaths: [],
+        taskId: null,
+        taskSlug: null,
+      }),
+    ).toEqual({ label: "Expanded to full", canExpand: false, fellBack: false });
+    expect(
+      worktreeMaterializationPresentation({
+        requestedProfileId: "governance-review",
+        effectiveProfileId: "governance-review",
+        mode: "sparse",
+        reason: null,
+        expectedContractSha256: null,
+        contractSha256: null,
+        manifestSha256: null,
+        conePaths: [],
+        requiredPaths: [],
+        taskId: null,
+        taskSlug: null,
+      }),
+    ).toEqual({
+      label: "Sparse profile: governance-review",
+      canExpand: true,
+      fellBack: false,
+    });
   });
 });
 

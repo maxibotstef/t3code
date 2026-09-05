@@ -9,6 +9,9 @@ import {
   type OrchestrationSession,
   ThreadId,
   type ProviderSession,
+  type OrchestrationThread,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
+  type VcsWorktreeMaterializationRequest,
   type RuntimeMode,
   type TurnId,
 } from "@t3tools/contracts";
@@ -483,14 +486,19 @@ const make = Effect.gen(function* () {
    * Recreates a thread's worktree from its branch when the directory has
    * disappeared. Provider sessions resume into the persisted cwd, so a missing
    * worktree makes every later turn fail as a bogus "session not found".
-   * Best-effort: on failure the turn proceeds and reports the real error.
+   * Recreation is best-effort; the mandatory verifier blocks the turn if the
+   * restored path is absent or does not match the persisted materialization.
    */
-  const ensureThreadWorktree = Effect.fnUntraced(function* (thread: {
-    readonly id: ThreadId;
-    readonly projectId: ProjectId;
-    readonly branch: string | null;
-    readonly worktreePath: string | null;
-  }) {
+  const ensureThreadWorktree = Effect.fnUntraced(function* (
+    thread: {
+      readonly id: ThreadId;
+      readonly projectId: ProjectId;
+      readonly branch: string | null;
+      readonly worktreePath: string | null;
+      readonly materialization?: OrchestrationThread["materialization"];
+    },
+    createdAt: string,
+  ) {
     const { worktreePath, branch } = thread;
     if (!worktreePath || !branch) {
       return;
@@ -511,8 +519,58 @@ const make = Effect.gen(function* () {
     });
     // A directory deleted without `git worktree remove` leaves an admin entry
     // that makes `git worktree add` refuse the path; prune clears it.
-    yield* gitWorkflow.pruneWorktrees({ cwd }).pipe(
-      Effect.andThen(gitWorkflow.createWorktree({ cwd, refName: branch, path: worktreePath })),
+    const persistedMaterialization = thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE;
+    const taskCardPath = persistedMaterialization.taskCardPath ?? null;
+    const hasNonDefaultIdentity = !Equal.equals(
+      persistedMaterialization,
+      FULL_WORKTREE_MATERIALIZATION_STATE,
+    );
+    const rehydrationMaterialization =
+      hasNonDefaultIdentity &&
+      persistedMaterialization.expectedContractSha256 &&
+      persistedMaterialization.taskId &&
+      persistedMaterialization.taskSlug &&
+      taskCardPath &&
+      persistedMaterialization.scopePaths?.length
+        ? ({
+            requestedProfileId: persistedMaterialization.effectiveProfileId,
+            expectedContractSha256: persistedMaterialization.expectedContractSha256,
+            taskId: persistedMaterialization.taskId,
+            taskSlug: persistedMaterialization.taskSlug,
+            taskCardPath,
+            scopePaths: persistedMaterialization.scopePaths ?? [],
+            ...(persistedMaterialization.taskClasses
+              ? { taskClasses: persistedMaterialization.taskClasses }
+              : {}),
+            ...(persistedMaterialization.includeResearchTask === true
+              ? { includeResearchTask: true }
+              : {}),
+          } satisfies VcsWorktreeMaterializationRequest)
+        : undefined;
+    const rehydrateAsLegacyFull =
+      hasNonDefaultIdentity &&
+      persistedMaterialization.effectiveProfileId === "full" &&
+      !rehydrationMaterialization;
+    if (hasNonDefaultIdentity && !rehydrationMaterialization && !rehydrateAsLegacyFull) {
+      yield* Effect.logWarning(
+        "provider command reactor cannot recreate worktree with incomplete materialization identity",
+        {
+          threadId: thread.id,
+          worktreePath,
+          effectiveProfileId: persistedMaterialization.effectiveProfileId,
+        },
+      );
+      return;
+    }
+    const recreated = yield* gitWorkflow.pruneWorktrees({ cwd }).pipe(
+      Effect.andThen(
+        gitWorkflow.createWorktree({
+          cwd,
+          refName: branch,
+          path: worktreePath,
+          ...(rehydrationMaterialization ? { materialization: rehydrationMaterialization } : {}),
+        }),
+      ),
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.failCause(cause)
@@ -520,9 +578,80 @@ const make = Effect.gen(function* () {
               threadId: thread.id,
               worktreePath,
               cause: Cause.pretty(cause),
-            }),
+            }).pipe(Effect.as(null)),
       ),
     );
+    const recreatedMaterialization = recreated?.materialization;
+    if (rehydrateAsLegacyFull && recreated) {
+      const verifiedLegacyFull = yield* gitWorkflow
+        .verifyWorktreeMaterialization(worktreePath)
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : Effect.logWarning(
+                  "provider command reactor could not verify legacy full recreation",
+                  {
+                    threadId: thread.id,
+                    worktreePath,
+                    cause: Cause.pretty(cause),
+                  },
+                ).pipe(Effect.as(null)),
+          ),
+        );
+      if (!verifiedLegacyFull) return;
+      if (!Equal.equals(verifiedLegacyFull, FULL_WORKTREE_MATERIALIZATION_STATE)) {
+        yield* Effect.logWarning(
+          "provider command reactor legacy full recreation did not verify as default full",
+          {
+            threadId: thread.id,
+            worktreePath,
+            recreatedEffectiveProfileId: verifiedLegacyFull.effectiveProfileId,
+          },
+        );
+        return;
+      }
+      yield* Effect.logInfo(
+        "provider command reactor recovered incomplete materialization as legacy full",
+        {
+          threadId: thread.id,
+          worktreePath,
+          priorRequestedProfileId: persistedMaterialization.requestedProfileId,
+          priorReason: persistedMaterialization.reason,
+        },
+      );
+      yield* orchestrationEngine.dispatch({
+        type: "thread.materialization.set",
+        commandId: yield* serverCommandId("rehydrate-legacy-full-materialization-set"),
+        threadId: thread.id,
+        materialization: verifiedLegacyFull,
+        createdAt,
+      });
+      return verifiedLegacyFull;
+    }
+    if (!rehydrationMaterialization || !recreatedMaterialization) return;
+    if (
+      recreatedMaterialization.effectiveProfileId !== persistedMaterialization.effectiveProfileId
+    ) {
+      yield* Effect.logWarning(
+        "provider command reactor recreated worktree with a different effective materialization",
+        {
+          threadId: thread.id,
+          worktreePath,
+          persistedEffectiveProfileId: persistedMaterialization.effectiveProfileId,
+          recreatedEffectiveProfileId: recreatedMaterialization.effectiveProfileId,
+        },
+      );
+      return;
+    }
+    yield* orchestrationEngine.dispatch({
+      type: "thread.materialization.set",
+      commandId: yield* serverCommandId("rehydrate-thread-materialization-set"),
+      threadId: thread.id,
+      materialization: recreatedMaterialization,
+      createdAt,
+    });
+    return recreatedMaterialization;
   });
 
   const resolveThread = Effect.fnUntraced(function* (threadId: ThreadId) {
@@ -1232,6 +1361,12 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    const isCompactCommand = isCompactCommandMessage(message);
+    const nonCompactUserMessageCount = thread.messages.filter(
+      (entry) => entry.role === "user" && !isCompactCommandMessage(entry),
+    ).length;
+    const isPristineWorktreeTurn = nonCompactUserMessageCount === 1 && !isCompactCommand;
+
     const authCommandHandled = yield* Effect.gen(function* () {
       // Native account commands belong to the thread's existing provider session.
       const instanceId =
@@ -1283,12 +1418,60 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    yield* ensureThreadWorktree(thread);
+    const recreatedMaterialization = yield* ensureThreadWorktree(thread, event.payload.createdAt);
 
-    const isCompactCommand = isCompactCommandMessage(message);
-    const nonCompactUserMessageCount = thread.messages.filter(
-      (entry) => entry.role === "user" && !isCompactCommandMessage(entry),
-    ).length;
+    const materializationReady = yield* Effect.gen(function* () {
+      if (!thread.worktreePath) return true;
+      const expectedMaterialization =
+        recreatedMaterialization ?? thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE;
+      const verification = yield* gitWorkflow
+        .verifyWorktreeMaterialization(thread.worktreePath)
+        .pipe(
+          Effect.map((materialization) => ({ _tag: "Success", materialization }) as const),
+          Effect.catchCause((cause) => Effect.succeed({ _tag: "Failure" as const, cause })),
+        );
+      if (
+        verification._tag === "Success" &&
+        Equal.equals(verification.materialization, expectedMaterialization)
+      ) {
+        return true;
+      }
+      if (!isPristineWorktreeTurn) {
+        if (verification._tag === "Failure") {
+          return yield* Effect.failCause(verification.cause);
+        }
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabelFromInstanceHint({
+            instanceId: String(thread.modelSelection.instanceId),
+          }),
+          method: "thread.turn.start",
+          detail:
+            "Persisted thread materialization does not match the worktree. Preserve changes in an ordinary named commit or operator-approved external copy, reach a clean state without automated stash/reset/clean/removal, run expand-full, then reverify.",
+        });
+      }
+      const expanded = yield* gitWorkflow.expandWorktreeMaterializationFull(
+        thread.worktreePath,
+        verification._tag === "Failure"
+          ? "pre-first-turn:verification-failed"
+          : "pre-first-turn:materialization-mismatch",
+      );
+      yield* orchestrationEngine.dispatch({
+        type: "thread.materialization.set",
+        commandId: yield* serverCommandId("pre-first-turn-materialization-expand"),
+        threadId: thread.id,
+        materialization: expanded,
+        createdAt: event.payload.createdAt,
+      });
+      return true;
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : recoverTurnStartFailure(cause).pipe(Effect.as(false)),
+      ),
+    );
+    if (!materializationReady) return;
+
     if (nonCompactUserMessageCount === 1 && !isCompactCommand) {
       const project = yield* resolveProject(thread.projectId);
       const generationCwd =

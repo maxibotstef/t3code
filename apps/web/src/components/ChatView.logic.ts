@@ -16,6 +16,8 @@ import {
   type ScopedThreadRef,
   type ThreadId,
   type TurnId,
+  type VcsWorktreeMaterializationRequest,
+  type VcsWorktreeMaterializationState,
 } from "@t3tools/contracts";
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import {
@@ -60,6 +62,187 @@ export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
 export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
+
+export interface WorktreeMaterializationUiContract {
+  readonly schemaVersion: string;
+  readonly profiles: ReadonlyArray<{ readonly id: string; readonly mode: "full" | "sparse" }>;
+}
+
+export function parseWorktreeMaterializationUiContract(
+  contents: string,
+): WorktreeMaterializationUiContract | null {
+  try {
+    const parsed = JSON.parse(contents) as Partial<WorktreeMaterializationUiContract>;
+    if (
+      parsed.schemaVersion !== "clawd.worktree-materialization-profiles.v1" ||
+      !Array.isArray(parsed.profiles) ||
+      parsed.profiles.length === 0 ||
+      parsed.profiles[0]?.id !== "full" ||
+      parsed.profiles.some(
+        (profile) =>
+          typeof profile?.id !== "string" || !["full", "sparse"].includes(profile.mode ?? ""),
+      )
+    ) {
+      return null;
+    }
+    return parsed as WorktreeMaterializationUiContract;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveUiWorktreeMaterializationRequest(input: {
+  readonly requestedProfileId: string;
+  readonly contractSha256: string | null;
+  readonly taskCardContents: string | null;
+  readonly taskCardPath: string;
+}): VcsWorktreeMaterializationRequest | undefined {
+  if (input.requestedProfileId === "full") return undefined;
+  try {
+    const card = JSON.parse(input.taskCardContents ?? "") as {
+      readonly issue?: { readonly id?: string };
+      readonly issueId?: string;
+      readonly materialization?: Partial<VcsWorktreeMaterializationRequest>;
+      readonly verification?: {
+        readonly status?: string;
+        readonly args?: Readonly<Record<string, unknown>>;
+      };
+    };
+    const declared = card.materialization;
+    const verifierPathsValue =
+      card.verification?.status === "declared" ? card.verification.args?.paths : undefined;
+    const verificationArgsValid =
+      verifierPathsValue === undefined ||
+      (Array.isArray(verifierPathsValue) &&
+        verifierPathsValue.every(
+          (candidate) => typeof candidate === "string" && candidate.trim().length > 0,
+        ));
+    const verifierPaths = verificationArgsValid
+      ? ((verifierPathsValue ?? []) as ReadonlyArray<string>).map((candidate) => candidate.trim())
+      : [];
+    const normalizeIssueId = (value: unknown) =>
+      String(value ?? "")
+        .trim()
+        .toLowerCase()
+        .replaceAll(/[^a-z0-9-]+/g, "-")
+        .replaceAll(/^-+|-+$/g, "");
+    const selectedCardPath = input.taskCardPath.trim().replaceAll("\\", "/");
+    const cardPathParts = selectedCardPath.split("/");
+    const expectedTaskSlug = cardPathParts.length >= 2 ? cardPathParts.at(-2) : undefined;
+    const taskId = typeof declared?.taskId === "string" ? declared.taskId.trim() : "";
+    const taskSlug = typeof declared?.taskSlug === "string" ? declared.taskSlug.trim() : "";
+    const scopePaths = Array.isArray(declared?.scopePaths)
+      ? declared.scopePaths.map((scopePath) =>
+          typeof scopePath === "string" ? scopePath.trim() : scopePath,
+        )
+      : [];
+    const taskClasses = Array.isArray(declared?.taskClasses)
+      ? declared.taskClasses.map((taskClass) =>
+          typeof taskClass === "string" ? taskClass.trim() : taskClass,
+        )
+      : declared?.taskClasses;
+    if (
+      !declared ||
+      !verificationArgsValid ||
+      declared.requestedProfileId !== input.requestedProfileId ||
+      input.contractSha256 === null ||
+      typeof declared.expectedContractSha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(declared.expectedContractSha256) ||
+      declared.expectedContractSha256 !== input.contractSha256 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(taskId) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(taskSlug) ||
+      input.taskCardPath.trim().length === 0 ||
+      normalizeIssueId(card.issue?.id ?? card.issueId) !== normalizeIssueId(taskId) ||
+      taskSlug !== expectedTaskSlug ||
+      declared.taskCardPath !== selectedCardPath ||
+      scopePaths.length === 0 ||
+      scopePaths.some(
+        (scopePath) => typeof scopePath !== "string" || scopePath.trim().length === 0,
+      ) ||
+      (declared.taskClasses !== undefined &&
+        (!Array.isArray(taskClasses) ||
+          taskClasses.some(
+            (taskClass) => typeof taskClass !== "string" || taskClass.trim().length === 0,
+          )))
+    ) {
+      return undefined;
+    }
+    return {
+      requestedProfileId: declared.requestedProfileId,
+      expectedContractSha256: declared.expectedContractSha256,
+      taskId,
+      taskSlug,
+      taskCardPath: selectedCardPath,
+      scopePaths: [...new Set([...(scopePaths as Array<string>), ...verifierPaths])],
+      ...(Array.isArray(taskClasses) ? { taskClasses: taskClasses as Array<string> } : {}),
+      ...(declared.includeResearchTask === true ? { includeResearchTask: true } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function resolveMaterializationTaskCardRead(input: {
+  readonly enabled: boolean;
+  readonly requestedProfileId: string;
+  readonly taskCardPath: string;
+  readonly debouncedTaskCardPath: string;
+  readonly isPending: boolean;
+  readonly isError: boolean;
+  readonly data: { readonly contents: string; readonly truncated: boolean } | null | undefined;
+}): { readonly pending: boolean; readonly contents: string | null } {
+  if (!input.enabled || input.requestedProfileId === "full" || !input.taskCardPath.trim()) {
+    return { pending: false, contents: null };
+  }
+  const pathMatches = input.taskCardPath.trim() === input.debouncedTaskCardPath.trim();
+  const pending = !pathMatches || (input.isPending && !input.isError);
+  return {
+    pending,
+    contents:
+      !pending && !input.isError && input.data?.truncated === false ? input.data.contents : null,
+  };
+}
+
+export function buildUiWorktreeMaterializationRequest(input: {
+  readonly requestedProfileId: string;
+  readonly contractSha256: string | null;
+  readonly taskCardContents: string | null;
+  readonly taskCardPath: string;
+}): VcsWorktreeMaterializationRequest | undefined {
+  const fromCard = resolveUiWorktreeMaterializationRequest(input);
+  if (fromCard || input.requestedProfileId === "full") return fromCard;
+  if (!input.contractSha256) return undefined;
+  return {
+    requestedProfileId: input.requestedProfileId,
+    expectedContractSha256: input.contractSha256,
+    taskId: "invalid-context",
+    taskSlug: "invalid-context",
+    taskCardPath: input.taskCardPath.trim() || "invalid",
+    scopePaths: ["invalid"],
+    taskClasses: ["unclassified"],
+  };
+}
+
+export function worktreeMaterializationPresentation(
+  state: VcsWorktreeMaterializationState,
+): { readonly label: string; readonly canExpand: boolean; readonly fellBack: boolean } | null {
+  if (state.requestedProfileId === "full" && state.effectiveProfileId === "full") return null;
+  if (state.mode === "full") {
+    if (state.reason === "user-expand-full") {
+      return { label: "Expanded to full", canExpand: false, fellBack: false };
+    }
+    return {
+      label: `Requested ${state.requestedProfileId} → full${state.reason ? ` (${state.reason})` : ""}`,
+      canExpand: false,
+      fellBack: true,
+    };
+  }
+  return {
+    label: `Sparse profile: ${state.effectiveProfileId}`,
+    canExpand: true,
+    fellBack: false,
+  };
+}
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
 

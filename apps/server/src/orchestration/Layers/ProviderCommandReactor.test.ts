@@ -9,7 +9,10 @@ import {
   ProviderSession,
   ProviderDriverKind,
   ProviderInstanceId,
+  FULL_WORKTREE_MATERIALIZATION_STATE,
+  GitCommandError,
   ProviderSetupError,
+  type VcsWorktreeMaterializationState,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import {
@@ -177,10 +180,22 @@ describe("ProviderCommandReactor", () => {
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
+    readonly createWorktreeEffect?: (
+      worktreeInput: Parameters<
+        GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]
+      >[0],
+    ) => ReturnType<GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]>;
+    readonly expandWorktreeMaterializationEffect?: (
+      cwd: string,
+      reason: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
     readonly tryHandlePromptCommandEffect?: ProviderAuthService["Service"]["tryHandlePromptCommand"];
+    readonly verifyWorktreeMaterializationEffect?: (
+      cwd: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -302,8 +317,28 @@ describe("ProviderCommandReactor", () => {
     );
     const pruneWorktrees = vi.fn((_: { readonly cwd: string }) => Effect.void);
     const createWorktree = vi.fn(
-      (input: { readonly refName: string; readonly path: string | null }) =>
-        Effect.succeed({ worktree: { path: input.path ?? "", refName: input.refName } }),
+      (
+        worktreeInput: Parameters<
+          GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]
+        >[0],
+      ) =>
+        input?.createWorktreeEffect?.(worktreeInput) ??
+        Effect.succeed({
+          worktree: { path: worktreeInput.path ?? "", refName: worktreeInput.refName },
+        }),
+    );
+    const verifyWorktreeMaterialization = vi.fn(
+      (cwd: string) =>
+        input?.verifyWorktreeMaterializationEffect?.(cwd) ??
+        Effect.succeed(FULL_WORKTREE_MATERIALIZATION_STATE),
+    );
+    const expandWorktreeMaterializationFull = vi.fn(
+      (cwd: string, reason: string) =>
+        input?.expandWorktreeMaterializationEffect?.(cwd, reason) ??
+        Effect.succeed({
+          ...FULL_WORKTREE_MATERIALIZATION_STATE,
+          reason,
+        }),
     );
     const refreshStatus = vi.fn((_: string) =>
       Effect.succeed({
@@ -453,6 +488,8 @@ describe("ProviderCommandReactor", () => {
           renameBranch,
           pruneWorktrees,
           createWorktree,
+          verifyWorktreeMaterialization,
+          expandWorktreeMaterializationFull,
         } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
       ),
       Layer.provideMerge(
@@ -582,6 +619,8 @@ describe("ProviderCommandReactor", () => {
       renameBranch,
       pruneWorktrees,
       createWorktree,
+      verifyWorktreeMaterialization,
+      expandWorktreeMaterializationFull,
       refreshStatus,
       generateBranchName,
       generateThreadTitle,
@@ -2215,6 +2254,556 @@ describe("ProviderCommandReactor", () => {
     expect(harness.createWorktree.mock.invocationCallOrder[0]).toBeLessThan(
       harness.startSession.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("round-trips persisted sparse identity when recreating a missing worktree", async () => {
+    const sparseMaterialization: VcsWorktreeMaterializationState = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      effectiveProfileId: "governance-review",
+      mode: "sparse",
+      reason: null,
+      expectedContractSha256: "a".repeat(64),
+      contractSha256: "a".repeat(64),
+      manifestSha256: "b".repeat(64),
+      conePaths: ["docs"],
+      requiredPaths: ["docs/spec.md"],
+      taskId: "OC-1",
+      taskSlug: "sparse-rehydrate",
+      taskCardPath: "ops/stef-task/sparse-rehydrate/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+      taskClasses: ["source-task"],
+      includeResearchTask: true,
+    };
+    const recreatedMaterialization = {
+      ...sparseMaterialization,
+      baseSha: "c".repeat(40),
+      manifestSha256: "d".repeat(64),
+      reason: "rehydrated-effective-profile",
+    };
+    let createdMaterialization: VcsWorktreeMaterializationState | null = null;
+    const harness = await createHarness({
+      createWorktreeEffect: (worktreeInput) => {
+        createdMaterialization = recreatedMaterialization;
+        return Effect.succeed({
+          worktree: { path: worktreeInput.path ?? "", refName: worktreeInput.refName },
+          materialization: recreatedMaterialization,
+        });
+      },
+      verifyWorktreeMaterializationEffect: () =>
+        createdMaterialization
+          ? Effect.succeed(createdMaterialization)
+          : Effect.fail(
+              new GitCommandError({
+                operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                command: "git",
+                cwd: worktreePath,
+                detail: "worktree was not recreated",
+              }),
+            ),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const worktreePath = NodePath.join(harness.stateDir, "missing-sparse-worktree");
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-missing-sparse-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/sparse-restore",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-sparse-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: sparseMaterialization,
+        createdAt: now,
+      }),
+    );
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(sparseMaterialization);
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-missing-sparse-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-missing-sparse-worktree"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.createWorktree).toHaveBeenCalledWith({
+      cwd: "/tmp/provider-project",
+      refName: "feature/sparse-restore",
+      path: worktreePath,
+      materialization: {
+        requestedProfileId: "governance-review",
+        expectedContractSha256: "a".repeat(64),
+        taskId: "OC-1",
+        taskSlug: "sparse-rehydrate",
+        taskCardPath: "ops/stef-task/sparse-rehydrate/stef-task.json",
+        scopePaths: ["docs/spec.md"],
+        taskClasses: ["source-task"],
+        includeResearchTask: true,
+      },
+    });
+    expect(harness.createWorktree.mock.invocationCallOrder[0]).toBeLessThan(
+      harness.verifyWorktreeMaterialization.mock.invocationCallOrder[0]!,
+    );
+    expect(harness.verifyWorktreeMaterialization.mock.invocationCallOrder[0]).toBeLessThan(
+      harness.startSession.mock.invocationCallOrder[0]!,
+    );
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(recreatedMaterialization);
+  });
+
+  it("rehydrates a prior sparse fallback as full and persists the recreated identity", async () => {
+    const fallbackMaterialization: VcsWorktreeMaterializationState = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      reason: "sparse-setup-failed",
+      expectedContractSha256: "a".repeat(64),
+      contractSha256: "a".repeat(64),
+      taskId: "OC-FALLBACK",
+      taskSlug: "fallback-rehydrate",
+      taskCardPath: "ops/stef-task/fallback-rehydrate/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+      taskClasses: ["source-task"],
+      baseSha: "b".repeat(40),
+    };
+    const recreatedMaterialization: VcsWorktreeMaterializationState = {
+      ...fallbackMaterialization,
+      requestedProfileId: "full",
+      reason: "explicit-full",
+      baseSha: "c".repeat(40),
+    };
+    let createdMaterialization: VcsWorktreeMaterializationState | null = null;
+    const harness = await createHarness({
+      createWorktreeEffect: (worktreeInput) => {
+        createdMaterialization = recreatedMaterialization;
+        return Effect.succeed({
+          worktree: { path: worktreeInput.path ?? "", refName: worktreeInput.refName },
+          materialization: recreatedMaterialization,
+        });
+      },
+      verifyWorktreeMaterializationEffect: () =>
+        createdMaterialization
+          ? Effect.succeed(createdMaterialization)
+          : Effect.fail(
+              new GitCommandError({
+                operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                command: "git",
+                cwd: "/missing",
+                detail: "worktree was not recreated",
+              }),
+            ),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const worktreePath = NodePath.join(harness.stateDir, "missing-fallback-worktree");
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-missing-fallback-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/fallback-restore",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-fallback-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: fallbackMaterialization,
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-missing-fallback-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-missing-fallback-worktree"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.createWorktree).toHaveBeenCalledWith({
+      cwd: "/tmp/provider-project",
+      refName: "feature/fallback-restore",
+      path: worktreePath,
+      materialization: {
+        requestedProfileId: "full",
+        expectedContractSha256: "a".repeat(64),
+        taskId: "OC-FALLBACK",
+        taskSlug: "fallback-rehydrate",
+        taskCardPath: "ops/stef-task/fallback-rehydrate/stef-task.json",
+        scopePaths: ["docs/spec.md"],
+        taskClasses: ["source-task"],
+      },
+    });
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(recreatedMaterialization);
+  });
+
+  it("rehydrates incomplete effective-full identity through verified legacy full", async () => {
+    const incompleteFallback: VcsWorktreeMaterializationState = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      reason: "task-card-materialization-failed",
+    };
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const worktreePath = NodePath.join(harness.stateDir, "missing-incomplete-full-worktree");
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-missing-incomplete-full-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/incomplete-full-restore",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-incomplete-full-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: incompleteFallback,
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-missing-incomplete-full-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-missing-incomplete-full-worktree"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.createWorktree).toHaveBeenCalledWith({
+      cwd: "/tmp/provider-project",
+      refName: "feature/incomplete-full-restore",
+      path: worktreePath,
+    });
+    expect(harness.verifyWorktreeMaterialization).toHaveBeenCalledWith(worktreePath);
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(FULL_WORKTREE_MATERIALIZATION_STATE);
+  });
+
+  it("surfaces a hard legacy-full verification failure before provider start", async () => {
+    const worktreePath = "/tmp/incomplete-full-verification-failure";
+    const verificationError = new GitCommandError({
+      operation: "GitVcsDriver.verifyWorktreeMaterialization",
+      command: "git",
+      cwd: worktreePath,
+      detail: "injected legacy full verification failure",
+    });
+    const harness = await createHarness({
+      verifyWorktreeMaterializationEffect: () => Effect.fail(verificationError),
+      expandWorktreeMaterializationEffect: () => Effect.fail(verificationError),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-incomplete-full-verification-failure"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/incomplete-full-verification-failure",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-incomplete-full-verification-state"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: {
+          ...FULL_WORKTREE_MATERIALIZATION_STATE,
+          requestedProfileId: "governance-review",
+          reason: "task-card-materialization-failed",
+        },
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-incomplete-full-verification-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-incomplete-full-verification-failure"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.session?.status === "error";
+    });
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.session?.lastError,
+    ).toContain("injected legacy full verification failure");
+  });
+
+  it("accepts legacy full materialization before a worktree turn", async () => {
+    const harness = await createHarness();
+    const worktreePath = NodePath.join(harness.stateDir, "legacy-full-worktree");
+    NodeFS.mkdirSync(worktreePath, { recursive: true });
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-legacy-full"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/legacy-full",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-legacy-full"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-legacy-full"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.verifyWorktreeMaterialization).toHaveBeenCalledWith(worktreePath);
+  });
+
+  it("expands and persists a materialization mismatch before the pristine first turn", async () => {
+    const expandedMaterialization = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      reason: "pre-first-turn:mismatch",
+      expectedContractSha256: "a".repeat(64),
+      contractSha256: "a".repeat(64),
+      taskId: "OC-PRISTINE",
+      taskSlug: "pristine-expand",
+      taskCardPath: "ops/stef-task/pristine-expand/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+    } satisfies VcsWorktreeMaterializationState;
+    const harness = await createHarness({
+      verifyWorktreeMaterializationEffect: () =>
+        Effect.succeed({
+          ...FULL_WORKTREE_MATERIALIZATION_STATE,
+          requestedProfileId: "governance-review",
+          effectiveProfileId: "governance-review",
+          mode: "sparse",
+          reason: null,
+        }),
+      expandWorktreeMaterializationEffect: () => Effect.succeed(expandedMaterialization),
+    });
+    const worktreePath = NodePath.join(harness.stateDir, "mismatched-worktree");
+    NodeFS.mkdirSync(worktreePath, { recursive: true });
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-mismatched-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/mismatch",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-mismatched-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-mismatched-materialization"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(harness.expandWorktreeMaterializationFull).toHaveBeenCalledWith(
+      worktreePath,
+      "pre-first-turn:materialization-mismatch",
+    );
+    expect(thread?.materialization).toEqual(expandedMaterialization);
+    expect(thread?.session?.lastError).toBeNull();
+  });
+
+  it("expands and persists a verifier failure before the pristine first turn", async () => {
+    const worktreePath = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-verifier-error-worktree-"),
+    );
+    const harness = await createHarness({
+      verifyWorktreeMaterializationEffect: () =>
+        Effect.fail(
+          new GitCommandError({
+            operation: "GitVcsDriver.verifyWorktreeMaterialization",
+            command: "git",
+            cwd: worktreePath,
+            detail: "required paths missing; run expand-full, then reverify",
+          }),
+        ),
+      expandWorktreeMaterializationEffect: (_cwd, reason) =>
+        Effect.succeed({ ...FULL_WORKTREE_MATERIALIZATION_STATE, reason }),
+    });
+    createdStateDirs.add(worktreePath);
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-verifier-error"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/verifier-error",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-verifier-error"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-verifier-error"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.expandWorktreeMaterializationFull).toHaveBeenCalledWith(
+      worktreePath,
+      "pre-first-turn:verification-failed",
+    );
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual({
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      reason: "pre-first-turn:verification-failed",
+    });
+  });
+
+  it("blocks a verifier failure after work has begun without expanding", async () => {
+    const worktreePath = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-post-work-verifier-error-"),
+    );
+    let verificationCount = 0;
+    const harness = await createHarness({
+      verifyWorktreeMaterializationEffect: () => {
+        verificationCount += 1;
+        return verificationCount === 1
+          ? Effect.succeed(FULL_WORKTREE_MATERIALIZATION_STATE)
+          : Effect.fail(
+              new GitCommandError({
+                operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                command: "git",
+                cwd: worktreePath,
+                detail: "required paths missing; run expand-full, then reverify",
+              }),
+            );
+      },
+    });
+    createdStateDirs.add(worktreePath);
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-post-work-verifier-error"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/post-work-verifier-error",
+        worktreePath,
+      }),
+    );
+    for (const index of [1, 2]) {
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-turn-start-post-work-verifier-error-${index}`),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId(`user-message-post-work-verifier-error-${index}`),
+            role: "user",
+            text: "continue",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        }),
+      );
+      if (index === 1) await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    }
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.session?.status === "error";
+    });
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.expandWorktreeMaterializationFull).not.toHaveBeenCalled();
   });
 
   it("forwards codex model options through session start and turn send", async () => {
