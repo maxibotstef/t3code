@@ -2529,6 +2529,72 @@ describe("ProviderCommandReactor", () => {
     ).toEqual(FULL_WORKTREE_MATERIALIZATION_STATE);
   });
 
+  it("surfaces a hard legacy-full verification failure before provider start", async () => {
+    const worktreePath = "/tmp/incomplete-full-verification-failure";
+    const verificationError = new GitCommandError({
+      operation: "GitVcsDriver.verifyWorktreeMaterialization",
+      command: "git",
+      cwd: worktreePath,
+      detail: "injected legacy full verification failure",
+    });
+    const harness = await createHarness({
+      verifyWorktreeMaterializationEffect: () => Effect.fail(verificationError),
+      expandWorktreeMaterializationEffect: () => Effect.fail(verificationError),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-incomplete-full-verification-failure"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/incomplete-full-verification-failure",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-incomplete-full-verification-state"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: {
+          ...FULL_WORKTREE_MATERIALIZATION_STATE,
+          requestedProfileId: "governance-review",
+          reason: "task-card-materialization-failed",
+        },
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-incomplete-full-verification-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-incomplete-full-verification-failure"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.session?.status === "error";
+    });
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.session?.lastError,
+    ).toContain("injected legacy full verification failure");
+  });
+
   it("accepts legacy full materialization before a worktree turn", async () => {
     const harness = await createHarness();
     const worktreePath = NodePath.join(harness.stateDir, "legacy-full-worktree");

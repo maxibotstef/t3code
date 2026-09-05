@@ -583,7 +583,23 @@ const make = Effect.gen(function* () {
     );
     const recreatedMaterialization = recreated?.materialization;
     if (rehydrateAsLegacyFull && recreated) {
-      const verifiedLegacyFull = yield* gitWorkflow.verifyWorktreeMaterialization(worktreePath);
+      const verifiedLegacyFull = yield* gitWorkflow
+        .verifyWorktreeMaterialization(worktreePath)
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : Effect.logWarning(
+                  "provider command reactor could not verify legacy full recreation",
+                  {
+                    threadId: thread.id,
+                    worktreePath,
+                    cause: Cause.pretty(cause),
+                  },
+                ).pipe(Effect.as(null)),
+          ),
+        );
+      if (!verifiedLegacyFull) return;
       if (!Equal.equals(verifiedLegacyFull, FULL_WORKTREE_MATERIALIZATION_STATE)) {
         yield* Effect.logWarning(
           "provider command reactor legacy full recreation did not verify as default full",
@@ -595,6 +611,15 @@ const make = Effect.gen(function* () {
         );
         return;
       }
+      yield* Effect.logInfo(
+        "provider command reactor recovered incomplete materialization as legacy full",
+        {
+          threadId: thread.id,
+          worktreePath,
+          priorRequestedProfileId: persistedMaterialization.requestedProfileId,
+          priorReason: persistedMaterialization.reason,
+        },
+      );
       yield* orchestrationEngine.dispatch({
         type: "thread.materialization.set",
         commandId: yield* serverCommandId("rehydrate-legacy-full-materialization-set"),
