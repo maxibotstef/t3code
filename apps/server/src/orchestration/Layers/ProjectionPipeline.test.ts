@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "node:crypto";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -39,6 +40,7 @@ import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ServerConfig } from "../../config.ts";
+import { makeGitVcsDriverCore } from "../../vcs/GitVcsDriverCore.ts";
 
 const makeProjectionPipelinePrefixedTestLayer = (prefix: string) =>
   OrchestrationProjectionPipelineLive.pipe(
@@ -581,6 +583,271 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline materialization", (it) 
         },
       ]);
     }),
+  );
+
+  it.effect.skipIf(process.env.T3_MATERIALIZATION_CANARY_REPO === undefined)(
+    "persists source-built creator identity through query-only readback and clean expansion",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sourceRepo = process.env.T3_MATERIALIZATION_CANARY_REPO!;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const pathService = yield* Path.Path;
+          const cloneRoot = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-materialization-readback-",
+          });
+          const repo = pathService.join(cloneRoot, "repo");
+          const sparsePath = pathService.join(cloneRoot, "explicit-sparse");
+          const omittedPath = pathService.join(cloneRoot, "omitted-full");
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provide(
+              ServerConfig.layerTest(cloneRoot, { prefix: "t3-materialization-readback-server-" }),
+            ),
+          );
+          const git = (cwd: string, args: ReadonlyArray<string>) =>
+            driver.execute({
+              operation: "GitVcsDriver.test.materializationReadback",
+              cwd,
+              args,
+              maxOutputBytes: 4 * 1024 * 1024,
+            });
+          yield* git(cloneRoot, [
+            "clone",
+            "--quiet",
+            "--shared",
+            "--no-checkout",
+            sourceRepo,
+            repo,
+          ]);
+          const pinnedCommit = (yield* git(repo, ["rev-parse", "HEAD^{commit}"])).stdout.trim();
+          yield* git(repo, [
+            "checkout",
+            pinnedCommit,
+            "--",
+            "config/worktree-materialization-profiles.json",
+          ]);
+          yield* git(repo, ["read-tree", pinnedCommit]);
+          const contractRaw = (yield* git(repo, [
+            "show",
+            `${pinnedCommit}:config/worktree-materialization-profiles.json`,
+          ])).stdout;
+          const expectedContractSha256 = NodeCrypto.createHash("sha256")
+            .update(contractRaw)
+            .digest("hex");
+          const taskCardPath = (yield* git(repo, [
+            "ls-tree",
+            "-r",
+            "--name-only",
+            pinnedCommit,
+            "ops/stef-task",
+          ])).stdout
+            .split(/\r?\n/)
+            .find((candidate) => candidate.endsWith("/stef-task.json"));
+          if (!taskCardPath) return assert.fail("source-built readback needs a tracked task card");
+
+          const created = yield* driver.createWorktree({
+            cwd: repo,
+            path: sparsePath,
+            refName: pinnedCommit,
+            newRefName: "readback/explicit-sparse",
+            materialization: {
+              requestedProfileId: "governance-review",
+              expectedContractSha256,
+              taskId: "OC-L3-READBACK",
+              taskSlug: "source-built-readback",
+              taskCardPath,
+              scopePaths: ["builds/task-queue/lib/build-state.js"],
+              taskClasses: ["source-task"],
+            },
+          });
+          if (!created.materialization)
+            return assert.fail("explicit profile needs persisted identity");
+          const verifiedSparse = yield* driver.verifyWorktreeMaterialization(sparsePath);
+          assert.deepStrictEqual(verifiedSparse, created.materialization);
+
+          const projectionPipeline = yield* OrchestrationProjectionPipeline;
+          const eventStore = yield* OrchestrationEventStore;
+          const sql = yield* SqlClient.SqlClient;
+          const now = "2026-09-05T00:00:00.000Z";
+          const projectId = ProjectId.make("project-source-built-materialization");
+          const threadId = ThreadId.make("thread-source-built-materialization");
+          const initialEvents: Array<Parameters<typeof eventStore.append>[0]> = [
+            {
+              type: "project.created",
+              eventId: EventId.make("evt-source-built-project"),
+              aggregateKind: "project",
+              aggregateId: projectId,
+              occurredAt: now,
+              commandId: CommandId.make("cmd-source-built-project"),
+              causationEventId: null,
+              correlationId: CommandId.make("cmd-source-built-project"),
+              metadata: {},
+              payload: {
+                projectId,
+                title: "Source-built materialization",
+                workspaceRoot: repo,
+                defaultModelSelection: null,
+                scripts: [],
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+            {
+              type: "thread.created",
+              eventId: EventId.make("evt-source-built-thread"),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: now,
+              commandId: CommandId.make("cmd-source-built-thread"),
+              causationEventId: null,
+              correlationId: CommandId.make("cmd-source-built-thread"),
+              metadata: {},
+              payload: {
+                threadId,
+                projectId,
+                title: "Source-built thread",
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "gpt-5-codex",
+                },
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: created.worktree.refName,
+                worktreePath: created.worktree.path,
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+            {
+              type: "thread.materialization-set",
+              eventId: EventId.make("evt-source-built-materialization"),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: now,
+              commandId: CommandId.make("cmd-source-built-materialization"),
+              causationEventId: null,
+              correlationId: CommandId.make("cmd-source-built-materialization"),
+              metadata: {},
+              payload: {
+                threadId,
+                materialization: created.materialization,
+                updatedAt: now,
+              },
+            },
+          ];
+          yield* Effect.forEach(initialEvents, eventStore.append, { concurrency: 1 });
+          yield* projectionPipeline.bootstrap;
+          const readback = () =>
+            sql<{
+              readonly requested: string;
+              readonly effective: string;
+              readonly mode: string;
+              readonly expectedHash: string | null;
+              readonly contractHash: string | null;
+              readonly manifestHash: string | null;
+              readonly reason: string | null;
+            }>`
+              SELECT
+                materialization_requested_profile_id AS requested,
+                materialization_effective_profile_id AS effective,
+                materialization_mode AS mode,
+                materialization_expected_contract_sha256 AS "expectedHash",
+                materialization_contract_sha256 AS "contractHash",
+                materialization_manifest_sha256 AS "manifestHash",
+                materialization_reason AS reason
+              FROM projection_threads
+              WHERE thread_id = ${threadId}
+            `;
+          const sparseRows = yield* readback();
+          assert.deepStrictEqual(sparseRows, [
+            {
+              requested: created.materialization.requestedProfileId,
+              effective: "governance-review",
+              mode: "sparse",
+              expectedHash: created.materialization.expectedContractSha256,
+              contractHash: created.materialization.contractSha256,
+              manifestHash: created.materialization.manifestSha256,
+              reason: created.materialization.reason,
+            },
+          ]);
+
+          const expanded = yield* driver.expandWorktreeMaterializationFull(
+            sparsePath,
+            "source-built-readback-expand-full",
+          );
+          const expandedEvent = yield* eventStore.append({
+            type: "thread.materialization-set",
+            eventId: EventId.make("evt-source-built-expanded"),
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: "2026-09-05T00:00:01.000Z",
+            commandId: CommandId.make("cmd-source-built-expanded"),
+            causationEventId: null,
+            correlationId: CommandId.make("cmd-source-built-expanded"),
+            metadata: {},
+            payload: {
+              threadId,
+              materialization: expanded,
+              updatedAt: "2026-09-05T00:00:01.000Z",
+            },
+          });
+          yield* projectionPipeline.projectEvent(expandedEvent);
+          const expandedRows = yield* readback();
+          assert.equal(expandedRows[0]?.effective, "full");
+          assert.equal(expandedRows[0]?.mode, "full");
+          assert.equal(expandedRows[0]?.reason, "source-built-readback-expand-full");
+          assert.equal((yield* driver.verifyWorktreeMaterialization(sparsePath)).mode, "full");
+          assert.equal((yield* git(sparsePath, ["status", "--porcelain=v1"])).stdout.trim(), "");
+
+          const omitted = yield* driver.createWorktree({
+            cwd: repo,
+            path: omittedPath,
+            refName: pinnedCommit,
+            newRefName: "readback/omitted-full",
+          });
+          assert.equal(omitted.materialization, undefined);
+          const omittedFull = yield* driver.verifyWorktreeMaterialization(omittedPath);
+          assert.equal(omittedFull.effectiveProfileId, "full");
+          assert.equal(omittedFull.mode, "full");
+
+          const readbackOutput = process.env.T3_MATERIALIZATION_READBACK_OUTPUT;
+          if (readbackOutput) {
+            const requiredPathsPresent = (yield* Effect.forEach(
+              created.materialization.requiredPaths,
+              (relativePath) => fileSystem.exists(pathService.join(sparsePath, relativePath)),
+            )).every(Boolean);
+            const t3SourceHead = (yield* git(process.cwd(), [
+              "rev-parse",
+              "HEAD^{commit}",
+            ])).stdout.trim();
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            const readbackJson = JSON.stringify(
+              {
+                schemaVersion: "t3.source-built-materialization-readback.v1",
+                t3SourceHead,
+                clawdSourceHead: pinnedCommit,
+                explicitProfile: sparseRows[0],
+                expandedProfile: expandedRows[0],
+                omittedProfile: {
+                  effective: omittedFull.effectiveProfileId,
+                  mode: omittedFull.mode,
+                },
+                requiredPathsPresent,
+                cleanAfterExpansion: true,
+                queryOnlyDatabaseReadback: true,
+                isolatedTestState: cloneRoot,
+                installedBundleEdited: false,
+                liveDatabaseEdited: false,
+                serviceRestarted: false,
+              },
+              null,
+              2,
+            );
+            yield* fileSystem.writeFileString(readbackOutput, `${readbackJson}\n`);
+          }
+        }),
+      ),
+    300_000,
   );
 });
 
