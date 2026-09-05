@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -7,7 +8,7 @@ import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { assert, it } from "@effect/vitest";
 
-import { CheckpointRef, GitCommandError } from "@t3tools/contracts";
+import { CheckpointRef, GitCommandError, VcsProcessExitError } from "@t3tools/contracts";
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
@@ -123,6 +124,7 @@ for (const scenario of [
   "attributes",
   "attributes-symlink",
   "filter",
+  "global-filter",
   "unborn",
   "missing-index",
   "corrupt-index",
@@ -134,6 +136,11 @@ for (const scenario of [
   "cached-edit",
   "concurrent",
   "cache-write-failure",
+  "file-directory",
+  "directory-file",
+  "untracked-cache",
+  "submodule",
+  "alternating-worktrees",
 ] as const) {
   it.effect(`checkpoint tree matches fresh-index capture for ${scenario}`, () =>
     Effect.gen(function* () {
@@ -145,10 +152,16 @@ for (const scenario of [
       let cwd = path.join(parent, "repo");
       yield* fileSystem.makeDirectory(cwd);
       let failedCacheWrite = false;
+      let restoredCount = 0;
+      const vcsProcess = yield* VcsProcess.VcsProcess;
+      const globalConfig = path.join(parent, "global-config");
+      if (scenario === "global-filter")
+        yield* fileSystem.writeFileString(globalConfig, '[filter "unused"]\n clean = cat\n');
       const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
         Effect.provideService(FileSystem.FileSystem, {
           ...fileSystem,
           writeFile: (target, data, options) => {
+            if (target.includes("t3-checkpoint-index-")) restoredCount++;
             if (scenario !== "cache-write-failure" || !target.includes("t3-checkpoint-index-")) {
               return fileSystem.writeFile(target, data, options);
             }
@@ -165,6 +178,17 @@ for (const scenario of [
               ),
             );
           },
+        }),
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: (input) =>
+            vcsProcess.run(
+              scenario === "global-filter"
+                ? {
+                    ...input,
+                    env: { ...process.env, ...input.env, GIT_CONFIG_GLOBAL: globalConfig },
+                  }
+                : input,
+            ),
         }),
       );
       const git = (args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
@@ -193,6 +217,31 @@ for (const scenario of [
       if (scenario !== "unborn") {
         yield* git(["add", "."]);
         yield* git(["commit", "-m", "base"]);
+      }
+      if (scenario === "submodule") {
+        const sub = path.join(parent, "sub");
+        yield* fileSystem.makeDirectory(sub);
+        yield* git(["-C", sub, "init", "-b", "main"]);
+        yield* git(["-C", sub, "config", "user.name", "Test"]);
+        yield* git(["-C", sub, "config", "user.email", "test@example.invalid"]);
+        yield* fileSystem.writeFileString(path.join(sub, "file"), "sub base");
+        yield* git(["-C", sub, "add", "."]);
+        yield* git(["-C", sub, "commit", "-m", "sub base"]);
+        yield* git(["-c", "protocol.file.allow=always", "submodule", "add", sub, "sub"]);
+        yield* git(["commit", "-am", "add submodule"]);
+      }
+      if (scenario === "directory-file") {
+        yield* fileSystem.makeDirectory(path.join(cwd, "directory"));
+        yield* write("directory/child", "child");
+        yield* git(["add", "."]);
+        yield* git(["commit", "-m", "directory"]);
+      }
+      if (scenario === "untracked-cache") {
+        yield* git(["config", "core.untrackedCache", "true"]);
+        yield* git(["update-index", "--untracked-cache"]);
+      }
+      if (scenario === "alternating-worktrees") {
+        yield* git(["worktree", "add", "-b", "alternate", path.join(parent, "alternate")]);
       }
       if (scenario === "linked-worktree") {
         yield* git(["worktree", "add", "-b", "linked", path.join(parent, "linked")]);
@@ -246,6 +295,8 @@ for (const scenario of [
       const warmRef = CheckpointRef.make("refs/t3/checkpoints/warm-equivalence");
       yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: warmRef });
       if (scenario === "cache-write-failure") assert.isTrue(failedCacheWrite);
+      if (scenario === "global-filter" || scenario === "filter")
+        assert.strictEqual(restoredCount, 0);
       assert.strictEqual(
         (yield* git(["rev-parse", `${warmRef}^{tree}`])).stdout.trim(),
         baseline.stdout.trim(),
@@ -257,12 +308,38 @@ for (const scenario of [
           "config-removed",
           "head-changed",
           "cached-edit",
+          "file-directory",
+          "directory-file",
+          "untracked-cache",
+          "submodule",
         ].includes(scenario)
       ) {
         if (scenario === "attributes-removed" || scenario === "staged-attributes-removed")
           yield* fileSystem.remove(path.join(cwd, ".gitattributes"));
         if (scenario === "config-removed") yield* git(["config", "--unset", "core.autocrlf"]);
         if (scenario === "cached-edit") yield* write("a.txt", "edit\n");
+        if (scenario === "file-directory") {
+          yield* fileSystem.remove(path.join(cwd, "a.txt"));
+          yield* fileSystem.makeDirectory(path.join(cwd, "a.txt"));
+          yield* write("a.txt/child", "nested");
+        }
+        if (scenario === "directory-file") {
+          yield* fileSystem.remove(path.join(cwd, "directory"), { recursive: true });
+          yield* write("directory", "replacement");
+        }
+        if (scenario === "untracked-cache") {
+          yield* write("new-untracked", "added after warm capture");
+          yield* fileSystem.remove(path.join(cwd, "b.txt"));
+          yield* write("a.txt", "dirty cached tree");
+        }
+        if (scenario === "submodule") {
+          const sub = path.join(cwd, "sub");
+          yield* git(["-C", sub, "config", "user.name", "Test"]);
+          yield* git(["-C", sub, "config", "user.email", "test@example.invalid"]);
+          yield* write("sub/file", "sub new commit");
+          yield* git(["-C", sub, "commit", "-am", "sub change"]);
+          yield* write("sub/file", "sub uncommitted");
+        }
         if (scenario === "head-changed") {
           yield* write("committed.txt", "new head\n");
           yield* git(["add", "."]);
@@ -281,6 +358,37 @@ for (const scenario of [
           (yield* git(["rev-parse", `${checkpointRef}^{tree}`])).stdout.trim(),
           expected.stdout.trim(),
         );
+      }
+      if (scenario === "alternating-worktrees") {
+        const originalCwd = cwd;
+        const other = path.join(parent, "alternate");
+        const otherIndex = path.resolve(
+          other,
+          (yield* driver.execute({
+            operation: "fixture",
+            cwd: other,
+            args: ["rev-parse", "--git-path", "index"],
+          })).stdout.trim(),
+        );
+        const otherBefore = yield* fileSystem.readFile(otherIndex);
+        for (let i = 0; i < 4; i++) {
+          cwd = i % 2 ? originalCwd : other;
+          yield* write("a.txt", `worktree edit ${i}`);
+          const env = {
+            ...process.env,
+            GIT_INDEX_FILE: path.join(parent, `alternate-baseline-${i}`),
+          };
+          yield* git(["read-tree", "HEAD"], env);
+          yield* git(["add", "-A", "--", "."], env);
+          const expected = (yield* git(["write-tree"], env)).stdout;
+          yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef });
+          assert.strictEqual(
+            (yield* git(["rev-parse", `${checkpointRef}^{tree}`])).stdout,
+            expected,
+          );
+        }
+        assert.deepStrictEqual(yield* fileSystem.readFile(otherIndex), otherBefore);
+        cwd = originalCwd;
       }
       if (scenario === "concurrent") {
         yield* Effect.forEach(
@@ -313,6 +421,106 @@ for (const scenario of [
           "untracked\n",
         );
       }
+    }).pipe(Effect.scoped, Effect.provide(VcsProcess.layer), Effect.provide(NodeServices.layer)),
+  );
+}
+
+for (const failure of [
+  "corrupt",
+  "add",
+  "write-tree",
+  "fresh",
+  "commit-tree",
+  "update-ref",
+] as const) {
+  it.effect(`checkpoint restored-index recovery is bounded for ${failure}`, () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const process = yield* VcsProcess.VcsProcess;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-recovery-" });
+      let armed = false;
+      let recovering = false;
+      let restored = 0;
+      let attempts = 0;
+      let injected = 0;
+      const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+        Effect.provideService(FileSystem.FileSystem, {
+          ...fs,
+          writeFile: (target, bytes, options) => {
+            if (armed && target.includes("t3-checkpoint-index-")) {
+              restored++;
+              if (failure === "corrupt") return fs.writeFileString(target, "broken index");
+            }
+            return fs.writeFile(target, bytes, options);
+          },
+        }),
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: (input) =>
+            Effect.gen(function* () {
+              const capture =
+                armed && input.operation === "GitVcsDriver.checkpoints.captureCheckpoint";
+              if (capture && input.args[2] === "read-tree") attempts++;
+              if (
+                capture &&
+                !recovering &&
+                input.args[2] === (failure === "fresh" ? "add" : failure) &&
+                (injected === 0 || failure === "fresh")
+              ) {
+                injected++;
+                if (input.env?.GIT_INDEX_FILE) {
+                  yield* fs.writeFileString(`${input.env.GIT_INDEX_FILE}.lock`, "injected lock");
+                }
+                return yield* new VcsProcessExitError({
+                  operation: input.operation,
+                  command: input.command,
+                  cwd,
+                  exitCode: 1,
+                  detail: "injected checkpoint failure",
+                });
+              }
+              return yield* process.run(input);
+            }),
+        }),
+      );
+      const git = (args: ReadonlyArray<string>) =>
+        driver.execute({ operation: "fixture", cwd, args });
+      yield* git(["init", "-b", "main"]);
+      yield* git(["config", "user.name", "Test"]);
+      yield* git(["config", "user.email", "test@example.invalid"]);
+      yield* fs.writeFileString(path.join(cwd, "a"), "base");
+      yield* git(["add", "."]);
+      yield* git(["commit", "-m", "base"]);
+      const indexPath = path.join(cwd, ".git/index");
+      const before = yield* fs.readFile(indexPath);
+      const ref = CheckpointRef.make("refs/t3/checkpoints/recovery");
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: ref });
+      const original = (yield* git(["rev-parse", ref])).stdout;
+      yield* fs.writeFileString(path.join(cwd, "a"), "edit");
+      armed = true;
+      const result = yield* Effect.exit(
+        driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: ref }),
+      );
+      const fails = ["fresh", "commit-tree", "update-ref"].includes(failure);
+      assert.strictEqual(Exit.isFailure(result), fails);
+      assert.strictEqual(restored, 1);
+      assert.strictEqual(attempts, ["commit-tree", "update-ref"].includes(failure) ? 1 : 2);
+      if (fails) assert.strictEqual((yield* git(["rev-parse", ref])).stdout, original);
+      else assert.strictEqual((yield* git(["show", `${ref}:a`])).stdout, "edit");
+      if (failure === "fresh") {
+        assert.strictEqual(injected, 2);
+        recovering = true;
+        yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: ref });
+        assert.strictEqual((yield* git(["show", `${ref}:a`])).stdout, "edit");
+        assert.strictEqual(restored, 1, "failed cache was invalidated before the next capture");
+        assert.strictEqual(attempts, 3);
+      }
+      assert.deepStrictEqual(yield* fs.readFile(indexPath), before);
+      assert.isFalse(
+        (yield* fs.readDirectory(path.join(cwd, ".git"))).some((n) =>
+          n.startsWith("t3-checkpoint-index-"),
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(VcsProcess.layer), Effect.provide(NodeServices.layer)),
   );
 }

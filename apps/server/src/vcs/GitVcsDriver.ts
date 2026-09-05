@@ -826,48 +826,65 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         const cacheKey = headExists
           ? yield* checkpointCacheKey(input.cwd).pipe(Effect.orElseSucceed(() => undefined))
           : undefined;
-        if (headExists) {
-          if (cacheKey && checkpointIndexCache?.key === cacheKey) {
-            const cached = checkpointIndexCache;
-            const restored = yield* fileSystem.writeFile(tempIndexPath, cached.bytes).pipe(
-              // Advancing this timestamp would disable Git's racily-clean entry checks.
-              Effect.andThen(fileSystem.utimes(tempIndexPath, cached.mtime, cached.mtime)),
-              Effect.as(true),
-              Effect.orElseSucceed(() => false),
-            );
-            if (!restored) yield* removeTempIndex;
+        let restored = false;
+        if (cacheKey && checkpointIndexCache?.key === cacheKey) {
+          const cached = checkpointIndexCache;
+          restored = yield* fileSystem.writeFile(tempIndexPath, cached.bytes).pipe(
+            // Advancing this timestamp would disable Git's racily-clean entry checks.
+            Effect.andThen(fileSystem.utimes(tempIndexPath, cached.mtime, cached.mtime)),
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          );
+          if (!restored) {
+            if (checkpointIndexCache === cached) checkpointIndexCache = undefined;
+            yield* removeTempIndex;
+          }
+        }
+        const captureTree = Effect.gen(function* () {
+          if (headExists) {
+            yield* execute({
+              operation,
+              cwd: input.cwd,
+              args: ["read-tree", "--reset", "HEAD"],
+              env: commitEnv,
+            });
           }
           yield* execute({
             operation,
             cwd: input.cwd,
-            args: ["read-tree", "--reset", "HEAD"],
+            args: ["add", "-A", "--", "."],
             env: commitEnv,
           });
-        }
-
-        yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: ["add", "-A", "--", "."],
-          env: commitEnv,
-        });
-
-        const writeTreeResult = yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: ["write-tree"],
-          env: commitEnv,
-        });
-        const treeOid = writeTreeResult.stdout.trim();
-        if (treeOid.length === 0) {
-          return yield* new VcsProcessExitError({
+          const result = yield* execute({
             operation,
-            command: "git write-tree",
             cwd: input.cwd,
-            exitCode: 0,
-            detail: "git write-tree returned an empty tree oid.",
+            args: ["write-tree"],
+            env: commitEnv,
           });
-        }
+          const treeOid = result.stdout.trim();
+          if (treeOid.length === 0) {
+            return yield* new VcsProcessExitError({
+              operation,
+              command: "git write-tree",
+              cwd: input.cwd,
+              exitCode: 0,
+              detail: "git write-tree returned an empty tree oid.",
+            });
+          }
+          return treeOid;
+        });
+        const treeOid = yield* captureTree.pipe(
+          Effect.catch((error) =>
+            Effect.gen(function* () {
+              if (!restored) return yield* Effect.fail(error);
+              // A failed cached attempt must not poison subsequent captures. Retry only
+              // tree construction, once, with no private index or leftover lock.
+              checkpointIndexCache = undefined;
+              yield* removeTempIndex;
+              return yield* captureTree;
+            }),
+          ),
+        );
 
         const message = `t3 checkpoint ref=${input.checkpointRef}`;
         const commitTreeResult = yield* execute({
