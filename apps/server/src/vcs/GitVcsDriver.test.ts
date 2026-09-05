@@ -420,7 +420,10 @@ for (const scenario of [
           "untracked\n",
         );
       }
-    }).pipe(Effect.scoped, Effect.provide(VcsProcess.layer), Effect.provide(NodeServices.layer)),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(VcsProcess.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+    ),
   );
 }
 
@@ -527,6 +530,9 @@ for (const failure of [
           n.startsWith("t3-checkpoint-index-"),
         ),
       );
-    }).pipe(Effect.scoped, Effect.provide(VcsProcess.layer), Effect.provide(NodeServices.layer)),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(VcsProcess.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+    ),
   );
 }
