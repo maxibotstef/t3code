@@ -2472,6 +2472,63 @@ describe("ProviderCommandReactor", () => {
     ).toEqual(recreatedMaterialization);
   });
 
+  it("rehydrates incomplete effective-full identity through verified legacy full", async () => {
+    const incompleteFallback: VcsWorktreeMaterializationState = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      reason: "task-card-materialization-failed",
+    };
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const worktreePath = NodePath.join(harness.stateDir, "missing-incomplete-full-worktree");
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-missing-incomplete-full-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/incomplete-full-restore",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-incomplete-full-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: incompleteFallback,
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-missing-incomplete-full-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-missing-incomplete-full-worktree"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.createWorktree).toHaveBeenCalledWith({
+      cwd: "/tmp/provider-project",
+      refName: "feature/incomplete-full-restore",
+      path: worktreePath,
+    });
+    expect(harness.verifyWorktreeMaterialization).toHaveBeenCalledWith(worktreePath);
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(FULL_WORKTREE_MATERIALIZATION_STATE);
+  });
+
   it("accepts legacy full materialization before a worktree turn", async () => {
     const harness = await createHarness();
     const worktreePath = NodePath.join(harness.stateDir, "legacy-full-worktree");

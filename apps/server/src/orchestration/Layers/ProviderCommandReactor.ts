@@ -547,7 +547,11 @@ const make = Effect.gen(function* () {
               : {}),
           } satisfies VcsWorktreeMaterializationRequest)
         : undefined;
-    if (hasNonDefaultIdentity && !rehydrationMaterialization) {
+    const rehydrateAsLegacyFull =
+      hasNonDefaultIdentity &&
+      persistedMaterialization.effectiveProfileId === "full" &&
+      !rehydrationMaterialization;
+    if (hasNonDefaultIdentity && !rehydrationMaterialization && !rehydrateAsLegacyFull) {
       yield* Effect.logWarning(
         "provider command reactor cannot recreate worktree with incomplete materialization identity",
         {
@@ -578,6 +582,28 @@ const make = Effect.gen(function* () {
       ),
     );
     const recreatedMaterialization = recreated?.materialization;
+    if (rehydrateAsLegacyFull && recreated) {
+      const verifiedLegacyFull = yield* gitWorkflow.verifyWorktreeMaterialization(worktreePath);
+      if (!Equal.equals(verifiedLegacyFull, FULL_WORKTREE_MATERIALIZATION_STATE)) {
+        yield* Effect.logWarning(
+          "provider command reactor legacy full recreation did not verify as default full",
+          {
+            threadId: thread.id,
+            worktreePath,
+            recreatedEffectiveProfileId: verifiedLegacyFull.effectiveProfileId,
+          },
+        );
+        return;
+      }
+      yield* orchestrationEngine.dispatch({
+        type: "thread.materialization.set",
+        commandId: yield* serverCommandId("rehydrate-legacy-full-materialization-set"),
+        threadId: thread.id,
+        materialization: verifiedLegacyFull,
+        createdAt,
+      });
+      return verifiedLegacyFull;
+    }
     if (!rehydrationMaterialization || !recreatedMaterialization) return;
     if (
       recreatedMaterialization.effectiveProfileId !== persistedMaterialization.effectiveProfileId
