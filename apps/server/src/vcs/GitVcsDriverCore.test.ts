@@ -3575,35 +3575,34 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
             });
             assert.equal(full.worktree.path, fullPath);
             assert.equal(created.materialization?.effectiveProfileId, profileId);
-            assert.equal(yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]), fullTree);
-            assert.equal(
-              yield* git(sparsePath, ["rev-parse", "HEAD^{tree}"]),
-              yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]),
+            const fullTwinTree = yield* git(fullPath, ["rev-parse", "HEAD^{tree}"]);
+            const sparseTree = yield* git(sparsePath, ["rev-parse", "HEAD^{tree}"]);
+            assert.equal(fullTwinTree, fullTree);
+            assert.equal(sparseTree, fullTwinTree);
+            const fullTwinIndexHash = worktreeMaterializationSha256ForTest(
+              yield* git(fullPath, ["ls-files", "--stage"]),
             );
-            assert.equal(
-              worktreeMaterializationSha256ForTest(yield* git(sparsePath, ["ls-files", "--stage"])),
-              worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-files", "--stage"])),
+            const sparseIndexHash = worktreeMaterializationSha256ForTest(
+              yield* git(sparsePath, ["ls-files", "--stage"]),
             );
-            assert.equal(
-              worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-files", "--stage"])),
-              fullIndexHash,
-            );
-            assert.equal(
-              yield* git(sparsePath, ["ls-tree", "-r", "HEAD"]),
+            assert.equal(sparseIndexHash, fullTwinIndexHash);
+            assert.equal(fullTwinIndexHash, fullIndexHash);
+            const fullTwinModesHash = worktreeMaterializationSha256ForTest(
               yield* git(fullPath, ["ls-tree", "-r", "HEAD"]),
             );
-            assert.equal(
-              worktreeMaterializationSha256ForTest(yield* git(fullPath, ["ls-tree", "-r", "HEAD"])),
-              fullModesHash,
+            const sparseModesHash = worktreeMaterializationSha256ForTest(
+              yield* git(sparsePath, ["ls-tree", "-r", "HEAD"]),
             );
+            assert.equal(sparseModesHash, fullTwinModesHash);
+            assert.equal(fullTwinModesHash, fullModesHash);
             assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
             assert.equal(yield* git(fullPath, ["status", "--porcelain=v1"]), "");
             const fullTwinBytes = yield* logicalWorkingTreeBytes(fullPath);
             const sparseBytes = yield* logicalWorkingTreeBytes(sparsePath);
-            assert.ok(
-              sparseBytes <= fullTwinBytes * 0.5,
-              `${profileId}: ${sparseBytes}/${fullTwinBytes}`,
+            const reductionPct = Number(
+              (((fullTwinBytes - sparseBytes) / fullTwinBytes) * 100).toFixed(2),
             );
+            assert.ok(reductionPct >= 50, `${profileId}: ${sparseBytes}/${fullTwinBytes}`);
             const fullVerifier = runRealCanaryVerifier(fullPath, profileId);
             const sparseVerifier = runRealCanaryVerifier(sparsePath, profileId);
             assert.equal(
@@ -3612,27 +3611,87 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
               fullVerifier.error || fullVerifier.stderr || fullVerifier.stdout,
             );
             assert.deepStrictEqual(sparseVerifier, fullVerifier);
-            assert.equal(
-              realCanaryReviewPackManifest(sparsePath, scopePath),
-              realCanaryReviewPackManifest(fullPath, scopePath),
+            const verifierOutputSha256 = worktreeMaterializationSha256ForTest(
+              [
+                fullVerifier.status,
+                fullVerifier.signal,
+                fullVerifier.error,
+                fullVerifier.stdout,
+                fullVerifier.stderr,
+              ].join("\0"),
             );
+            const sparseReviewPackManifestSha256 = realCanaryReviewPackManifest(
+              sparsePath,
+              scopePath,
+            );
+            const fullReviewPackManifestSha256 = realCanaryReviewPackManifest(fullPath, scopePath);
+            assert.equal(sparseReviewPackManifestSha256, fullReviewPackManifestSha256);
+            const negativeControls: Array<{
+              readonly path: string;
+              readonly rejected: boolean;
+              readonly restored: boolean;
+            }> = [];
             for (const hiddenPath of [taskCardPath, scopePath]) {
               yield* fileSystem.remove(pathService.join(sparsePath, hiddenPath));
-              assert.equal(
-                (yield* Effect.result(driver.verifyWorktreeMaterialization(sparsePath)))._tag,
-                "Failure",
-              );
+              const rejected =
+                (yield* Effect.result(driver.verifyWorktreeMaterialization(sparsePath)))._tag ===
+                "Failure";
+              assert.equal(rejected, true);
               yield* git(sparsePath, ["checkout", "--", hiddenPath]);
+              const restored =
+                (yield* driver.verifyWorktreeMaterialization(sparsePath)).effectiveProfileId ===
+                profileId;
+              assert.equal(restored, true);
+              negativeControls.push({ path: hiddenPath, rejected, restored });
             }
-            assert.equal(
-              (yield* driver.expandWorktreeMaterializationFull(
-                sparsePath,
-                "real-canary-expand-full",
-              )).effectiveProfileId,
-              "full",
+            const expanded = yield* driver.expandWorktreeMaterializationFull(
+              sparsePath,
+              "real-canary-expand-full",
             );
+            assert.equal(expanded.effectiveProfileId, "full");
             assert.equal(yield* logicalWorkingTreeBytes(sparsePath), fullTwinBytes);
             assert.equal(yield* git(sparsePath, ["status", "--porcelain=v1"]), "");
+
+            const resultPath = process.env.T3_MATERIALIZATION_CANARY_RESULT_PATH;
+            if (resultPath) {
+              const t3SourceHead = yield* git(process.cwd(), ["rev-parse", "HEAD^{commit}"]);
+              // @effect-diagnostics-next-line preferSchemaOverJson:off
+              const resultJson = JSON.stringify(
+                {
+                  schemaVersion: "t3.materialization-real-canary-result.v1",
+                  ok: true,
+                  t3SourceHead,
+                  clawdSourceHead: pinnedCommit,
+                  profileId,
+                  pinnedCommit,
+                  fullTree,
+                  fullTwinTree,
+                  sparseTree,
+                  fullIndexHash,
+                  fullTwinIndexHash,
+                  sparseIndexHash,
+                  fullModesHash,
+                  fullTwinModesHash,
+                  sparseModesHash,
+                  fullTwinBytes,
+                  sparseBytes,
+                  reductionPct,
+                  requiredPaths: created.materialization?.requiredPaths ?? [],
+                  verifierPaths: realCanaryVerifierPaths(profileId),
+                  verifierOutputSha256,
+                  verifierParity: true,
+                  reviewPackManifestSha256: fullReviewPackManifestSha256,
+                  reviewPackParity: true,
+                  negativeControls,
+                  expansionStatus: expanded.mode,
+                  expansionReason: expanded.reason,
+                  cleanAfterExpansion: true,
+                },
+                null,
+                2,
+              );
+              yield* fileSystem.writeFileString(resultPath, `${resultJson}\n`);
+            }
           }
         }),
       300_000,
