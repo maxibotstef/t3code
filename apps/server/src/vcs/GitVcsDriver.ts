@@ -711,6 +711,82 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       return path.isAbsolute(gitCommonDir) ? gitCommonDir : path.resolve(cwd, gitCommonDir);
     });
 
+  // One private index per driver; never reuse the user's staged index or persist a cache file.
+  let checkpointIndexCache: { key: string; bytes: Uint8Array; mtime: Date } | undefined;
+
+  const checkpointCacheKey = Effect.fn("GitVcsDriver.checkpoints.cacheKey")(function* (
+    cwd: string,
+  ) {
+    const operation = "GitVcsDriver.checkpoints.cacheKey";
+    const config = yield* execute({
+      operation,
+      cwd,
+      args: [
+        "config",
+        "--null",
+        "--get-regexp",
+        "^core\\.(sparsecheckout|splitindex|autocrlf|eol|attributesfile|safecrlf|checkstat|trustctime|filemode|ignorecase|symlinks|ignorestat|fsmonitor)$|^filter\\.",
+      ],
+      allowNonZeroExit: true,
+      maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+      outputMode: "error",
+    });
+    if (config.exitCode !== 0 && config.exitCode !== 1) return undefined;
+    // Special index modes and custom filters keep the original fresh-index path.
+    if (
+      /core\.(sparsecheckout|splitindex|ignorestat|fsmonitor)\n(?!false\0)/i.test(config.stdout) ||
+      /core\.(trustctime|checkstat)\n|filter\./i.test(config.stdout)
+    )
+      return undefined;
+    const head = yield* execute({ operation, cwd, args: ["rev-parse", "HEAD"] });
+    const files = yield* execute({
+      operation,
+      cwd,
+      args: ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+      maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+      outputMode: "error",
+    });
+    const names = splitNullSeparatedGitStdoutPaths(files);
+    const indexedAttributes = yield* execute({
+      operation,
+      cwd,
+      args: ["ls-files", "-z", "--", ".gitattributes", ":(glob)**/.gitattributes"],
+      maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+      outputMode: "error",
+    });
+    const attributeNames = new Set([
+      ...names.filter((name) => name === ".gitattributes" || name.endsWith("/.gitattributes")),
+      ...splitNullSeparatedGitStdoutPaths(indexedAttributes),
+    ]);
+    const attributeFiles = yield* Effect.forEach([...attributeNames].sort(), (name) =>
+      Effect.gen(function* () {
+        const attributePath = path.join(cwd, name);
+        const link = yield* fileSystem.readLink(attributePath).pipe(Effect.option);
+        if (Option.isSome(link)) return [name, { symlink: link.value }];
+        return yield* fileSystem.readFileString(attributePath).pipe(
+          Effect.map((contents) => [name, contents]),
+          Effect.catchTag("PlatformError", (error) =>
+            error.reason._tag === "NotFound" ? Effect.succeed([name, null]) : Effect.fail(error),
+          ),
+        );
+      }),
+    );
+    const attributes =
+      names.length === 0
+        ? ""
+        : (yield* execute({
+            operation,
+            cwd,
+            args: ["check-attr", "--all", "-z", "--stdin"],
+            stdin: `${names.join("\0")}\0`,
+            maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+            outputMode: "error",
+          })).stdout;
+    return NodeCrypto.createHash("sha256")
+      .update(JSON.stringify([cwd, head.stdout, config.stdout, attributes, attributeFiles]))
+      .digest("hex");
+  });
+
   const checkpoints: VcsDriver.VcsCheckpointOps = {
     captureCheckpoint: Effect.fn("GitVcsDriver.checkpoints.captureCheckpoint")(function* (input) {
       const operation = "GitVcsDriver.checkpoints.captureCheckpoint";
@@ -728,17 +804,43 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         GIT_COMMITTER_EMAIL: "t3code@users.noreply.github.com",
       };
 
-      const cleanupTempIndex = fileSystem
-        .remove(tempIndexPath, { force: true })
-        .pipe(Effect.ignore);
+      const removeTempIndex = Effect.all([
+        fileSystem.remove(tempIndexPath, { force: true }),
+        fileSystem.remove(`${tempIndexPath}.lock`, { force: true }),
+      ]).pipe(
+        Effect.mapError(
+          (cause) =>
+            new VcsProcessExitError({
+              operation,
+              command: "checkpoint index cleanup",
+              cwd: input.cwd,
+              exitCode: 1,
+              detail: cause.message,
+            }),
+        ),
+      );
+      const cleanupTempIndex = removeTempIndex.pipe(Effect.ignore);
 
       yield* Effect.gen(function* () {
         const headExists = yield* hasHeadCommit(input.cwd);
+        const cacheKey = headExists
+          ? yield* checkpointCacheKey(input.cwd).pipe(Effect.orElseSucceed(() => undefined))
+          : undefined;
         if (headExists) {
+          if (cacheKey && checkpointIndexCache?.key === cacheKey) {
+            const cached = checkpointIndexCache;
+            const restored = yield* fileSystem.writeFile(tempIndexPath, cached.bytes).pipe(
+              // Advancing this timestamp would disable Git's racily-clean entry checks.
+              Effect.andThen(fileSystem.utimes(tempIndexPath, cached.mtime, cached.mtime)),
+              Effect.as(true),
+              Effect.orElseSucceed(() => false),
+            );
+            if (!restored) yield* removeTempIndex;
+          }
           yield* execute({
             operation,
             cwd: input.cwd,
-            args: ["read-tree", "HEAD"],
+            args: ["read-tree", "--reset", "HEAD"],
             env: commitEnv,
           });
         }
@@ -790,6 +892,24 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           cwd: input.cwd,
           args: ["update-ref", input.checkpointRef, commitOid],
         });
+        const finalKey = cacheKey
+          ? yield* checkpointCacheKey(input.cwd).pipe(Effect.orElseSucceed(() => undefined))
+          : undefined;
+        if (cacheKey && finalKey === cacheKey) {
+          const bytes = yield* fileSystem
+            .readFile(tempIndexPath)
+            .pipe(Effect.orElseSucceed(() => undefined));
+          const stat = yield* fileSystem
+            .stat(tempIndexPath)
+            .pipe(Effect.orElseSucceed(() => undefined));
+          const mtime = stat ? Option.getOrUndefined(stat.mtime) : undefined;
+          checkpointIndexCache =
+            bytes && mtime && bytes.length <= WORKSPACE_FILES_MAX_OUTPUT_BYTES
+              ? { key: cacheKey, bytes, mtime }
+              : undefined;
+        } else {
+          checkpointIndexCache = undefined;
+        }
       }).pipe(Effect.ensuring(cleanupTempIndex));
     }),
 
