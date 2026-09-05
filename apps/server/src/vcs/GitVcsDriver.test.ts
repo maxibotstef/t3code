@@ -155,8 +155,11 @@ for (const scenario of [
       let restoredCount = 0;
       const vcsProcess = yield* VcsProcess.VcsProcess;
       const globalConfig = path.join(parent, "global-config");
-      if (scenario === "global-filter")
-        yield* fileSystem.writeFileString(globalConfig, '[filter "unused"]\n clean = cat\n');
+      // Hosted runners may configure Git LFS globally; isolate the cache fixtures.
+      yield* fileSystem.writeFileString(
+        globalConfig,
+        scenario === "global-filter" ? '[filter "unused"]\n clean = cat\n' : "",
+      );
       const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
         Effect.provideService(FileSystem.FileSystem, {
           ...fileSystem,
@@ -181,14 +184,10 @@ for (const scenario of [
         }),
         Effect.provideService(VcsProcess.VcsProcess, {
           run: (input) =>
-            vcsProcess.run(
-              scenario === "global-filter"
-                ? {
-                    ...input,
-                    env: { ...process.env, ...input.env, GIT_CONFIG_GLOBAL: globalConfig },
-                  }
-                : input,
-            ),
+            vcsProcess.run({
+              ...input,
+              env: { ...input.env, GIT_CONFIG_GLOBAL: globalConfig, GIT_CONFIG_NOSYSTEM: "1" },
+            }),
         }),
       );
       const git = (args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
@@ -479,7 +478,14 @@ for (const failure of [
                   detail: "injected checkpoint failure",
                 });
               }
-              return yield* process.run(input);
+              return yield* process.run({
+                ...input,
+                env: {
+                  ...input.env,
+                  GIT_CONFIG_GLOBAL: path.join(cwd, ".git", "fixture-global-config"),
+                  GIT_CONFIG_NOSYSTEM: "1",
+                },
+              });
             }),
         }),
       );

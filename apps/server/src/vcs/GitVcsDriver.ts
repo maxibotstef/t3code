@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -340,6 +341,7 @@ export class GitVcsDriver extends Context.Service<
 >()("t3/vcs/GitVcsDriver") {}
 
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+const encodeCheckpointCacheKey = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const GIT_CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
 const CHECKPOINT_DIFF_MAX_OUTPUT_BYTES = 10_000_000;
 const WORKSPACE_GIT_HARDENED_CONFIG_ARGS = [
@@ -783,7 +785,9 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             outputMode: "error",
           })).stdout;
     return NodeCrypto.createHash("sha256")
-      .update(JSON.stringify([cwd, head.stdout, config.stdout, attributes, attributeFiles]))
+      .update(
+        encodeCheckpointCacheKey([cwd, head.stdout, config.stdout, attributes, attributeFiles]),
+      )
       .digest("hex");
   });
 
