@@ -154,7 +154,6 @@ worktree. First captures, misses and heavily dirty trees can still require expen
 Git staging. Clean synthetic repeat-capture timings do not establish first-capture
 latency or universal real-session speedups.
 
-
 Each turn is bracketed by workspace checkpoints so diffs and reverts are exact. `CheckpointStore`
 captures state as hidden Git refs through the VCS driver's checkpoint operations;
 `CheckpointDiffQuery` answers turn and full-thread diff requests; `CheckpointReactor` coordinates
