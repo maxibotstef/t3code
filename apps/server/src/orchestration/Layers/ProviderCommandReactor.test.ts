@@ -185,6 +185,10 @@ describe("ProviderCommandReactor", () => {
         GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]
       >[0],
     ) => ReturnType<GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]>;
+    readonly expandWorktreeMaterializationEffect?: (
+      cwd: string,
+      reason: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -327,6 +331,14 @@ describe("ProviderCommandReactor", () => {
       (cwd: string) =>
         input?.verifyWorktreeMaterializationEffect?.(cwd) ??
         Effect.succeed(FULL_WORKTREE_MATERIALIZATION_STATE),
+    );
+    const expandWorktreeMaterializationFull = vi.fn(
+      (cwd: string, reason: string) =>
+        input?.expandWorktreeMaterializationEffect?.(cwd, reason) ??
+        Effect.succeed({
+          ...FULL_WORKTREE_MATERIALIZATION_STATE,
+          reason,
+        }),
     );
     const refreshStatus = vi.fn((_: string) =>
       Effect.succeed({
@@ -477,6 +489,7 @@ describe("ProviderCommandReactor", () => {
           pruneWorktrees,
           createWorktree,
           verifyWorktreeMaterialization,
+          expandWorktreeMaterializationFull,
         } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
       ),
       Layer.provideMerge(
@@ -607,6 +620,7 @@ describe("ProviderCommandReactor", () => {
       pruneWorktrees,
       createWorktree,
       verifyWorktreeMaterialization,
+      expandWorktreeMaterializationFull,
       refreshStatus,
       generateBranchName,
       generateThreadTitle,
@@ -2491,7 +2505,18 @@ describe("ProviderCommandReactor", () => {
     expect(harness.verifyWorktreeMaterialization).toHaveBeenCalledWith(worktreePath);
   });
 
-  it("surfaces materialization mismatch as a session error and failure activity", async () => {
+  it("expands and persists a materialization mismatch before the pristine first turn", async () => {
+    const expandedMaterialization = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      reason: "pre-first-turn:mismatch",
+      expectedContractSha256: "a".repeat(64),
+      contractSha256: "a".repeat(64),
+      taskId: "OC-PRISTINE",
+      taskSlug: "pristine-expand",
+      taskCardPath: "ops/stef-task/pristine-expand/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+    } satisfies VcsWorktreeMaterializationState;
     const harness = await createHarness({
       verifyWorktreeMaterializationEffect: () =>
         Effect.succeed({
@@ -2501,6 +2526,7 @@ describe("ProviderCommandReactor", () => {
           mode: "sparse",
           reason: null,
         }),
+      expandWorktreeMaterializationEffect: () => Effect.succeed(expandedMaterialization),
     });
     const worktreePath = NodePath.join(harness.stateDir, "mismatched-worktree");
     NodeFS.mkdirSync(worktreePath, { recursive: true });
@@ -2529,25 +2555,19 @@ describe("ProviderCommandReactor", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       }),
     );
-    await waitFor(async () => {
-      const thread = (await harness.readModel()).threads.find(
-        (entry) => entry.id === ThreadId.make("thread-1"),
-      );
-      return thread?.session?.status === "error";
-    });
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
     const thread = (await harness.readModel()).threads.find(
       (entry) => entry.id === ThreadId.make("thread-1"),
     );
-    expect(harness.sendTurn).not.toHaveBeenCalled();
-    expect(thread?.session?.lastError).toContain("run expand-full, then reverify");
-    expect(
-      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
-    ).toMatchObject({
-      payload: { detail: expect.stringContaining("run expand-full, then reverify") },
-    });
+    expect(harness.expandWorktreeMaterializationFull).toHaveBeenCalledWith(
+      worktreePath,
+      "pre-first-turn:materialization-mismatch",
+    );
+    expect(thread?.materialization).toEqual(expandedMaterialization);
+    expect(thread?.session?.lastError).toBeNull();
   });
 
-  it("surfaces materialization verifier errors before provider start", async () => {
+  it("expands and persists a verifier failure before the pristine first turn", async () => {
     const worktreePath = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3-verifier-error-worktree-"),
     );
@@ -2561,6 +2581,8 @@ describe("ProviderCommandReactor", () => {
             detail: "required paths missing; run expand-full, then reverify",
           }),
         ),
+      expandWorktreeMaterializationEffect: (_cwd, reason) =>
+        Effect.succeed({ ...FULL_WORKTREE_MATERIALIZATION_STATE, reason }),
     });
     createdStateDirs.add(worktreePath);
     await harness.runEffect(
@@ -2588,13 +2610,77 @@ describe("ProviderCommandReactor", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       }),
     );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.expandWorktreeMaterializationFull).toHaveBeenCalledWith(
+      worktreePath,
+      "pre-first-turn:verification-failed",
+    );
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual({
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      reason: "pre-first-turn:verification-failed",
+    });
+  });
+
+  it("blocks a verifier failure after work has begun without expanding", async () => {
+    const worktreePath = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-post-work-verifier-error-"),
+    );
+    let verificationCount = 0;
+    const harness = await createHarness({
+      verifyWorktreeMaterializationEffect: () => {
+        verificationCount += 1;
+        return verificationCount === 1
+          ? Effect.succeed(FULL_WORKTREE_MATERIALIZATION_STATE)
+          : Effect.fail(
+              new GitCommandError({
+                operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                command: "git",
+                cwd: worktreePath,
+                detail: "required paths missing; run expand-full, then reverify",
+              }),
+            );
+      },
+    });
+    createdStateDirs.add(worktreePath);
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-post-work-verifier-error"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/post-work-verifier-error",
+        worktreePath,
+      }),
+    );
+    for (const index of [1, 2]) {
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-turn-start-post-work-verifier-error-${index}`),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId(`user-message-post-work-verifier-error-${index}`),
+            role: "user",
+            text: "continue",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        }),
+      );
+      if (index === 1) await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    }
     await waitFor(async () => {
       const thread = (await harness.readModel()).threads.find(
         (entry) => entry.id === ThreadId.make("thread-1"),
       );
       return thread?.session?.status === "error";
     });
-    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.expandWorktreeMaterializationFull).not.toHaveBeenCalled();
   });
 
   it("forwards codex model options through session start and turn send", async () => {

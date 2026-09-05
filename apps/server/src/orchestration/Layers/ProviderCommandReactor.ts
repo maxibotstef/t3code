@@ -1310,6 +1310,12 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    const isCompactCommand = isCompactCommandMessage(message);
+    const nonCompactUserMessageCount = thread.messages.filter(
+      (entry) => entry.role === "user" && !isCompactCommandMessage(entry),
+    ).length;
+    const isPristineWorktreeTurn = nonCompactUserMessageCount === 1 && !isCompactCommand;
+
     const authCommandHandled = yield* Effect.gen(function* () {
       // Native account commands belong to the thread's existing provider session.
       const instanceId =
@@ -1365,13 +1371,24 @@ const make = Effect.gen(function* () {
 
     const materializationReady = yield* Effect.gen(function* () {
       if (!thread.worktreePath) return true;
-      const materialization = yield* gitWorkflow.verifyWorktreeMaterialization(thread.worktreePath);
+      const expectedMaterialization =
+        recreatedMaterialization ?? thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE;
+      const verification = yield* gitWorkflow
+        .verifyWorktreeMaterialization(thread.worktreePath)
+        .pipe(
+          Effect.map((materialization) => ({ _tag: "Success", materialization }) as const),
+          Effect.catchCause((cause) => Effect.succeed({ _tag: "Failure" as const, cause })),
+        );
       if (
-        !Equal.equals(
-          materialization,
-          recreatedMaterialization ?? thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE,
-        )
+        verification._tag === "Success" &&
+        Equal.equals(verification.materialization, expectedMaterialization)
       ) {
+        return true;
+      }
+      if (!isPristineWorktreeTurn) {
+        if (verification._tag === "Failure") {
+          return yield* Effect.failCause(verification.cause);
+        }
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabelFromInstanceHint({
             instanceId: String(thread.modelSelection.instanceId),
@@ -1381,6 +1398,19 @@ const make = Effect.gen(function* () {
             "Persisted thread materialization does not match the worktree. Preserve changes in an ordinary named commit or operator-approved external copy, reach a clean state without automated stash/reset/clean/removal, run expand-full, then reverify.",
         });
       }
+      const expanded = yield* gitWorkflow.expandWorktreeMaterializationFull(
+        thread.worktreePath,
+        verification._tag === "Failure"
+          ? "pre-first-turn:verification-failed"
+          : "pre-first-turn:materialization-mismatch",
+      );
+      yield* orchestrationEngine.dispatch({
+        type: "thread.materialization.set",
+        commandId: yield* serverCommandId("pre-first-turn-materialization-expand"),
+        threadId: thread.id,
+        materialization: expanded,
+        createdAt: event.payload.createdAt,
+      });
       return true;
     }).pipe(
       Effect.catchCause((cause) =>
@@ -1391,10 +1421,6 @@ const make = Effect.gen(function* () {
     );
     if (!materializationReady) return;
 
-    const isCompactCommand = isCompactCommandMessage(message);
-    const nonCompactUserMessageCount = thread.messages.filter(
-      (entry) => entry.role === "user" && !isCompactCommandMessage(entry),
-    ).length;
     if (nonCompactUserMessageCount === 1 && !isCompactCommand) {
       const project = yield* resolveProject(thread.projectId);
       const generationCwd =
