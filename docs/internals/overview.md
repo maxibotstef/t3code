@@ -138,6 +138,22 @@ which agent is behind them. See [providers.md](./providers.md).
 
 ## Checkpointing
 
+The Git driver can reuse one private, in-memory checkpoint index (at most 16 MiB).
+It never seeds this cache from the user's staging index. A successful capture binds
+reuse to the checkout, HEAD, conversion configuration and attributes, preserving the
+index timestamp so Git still detects racily clean entries. If a restored index fails
+during tree construction, the driver discards it and its temporary lock and retries
+once with a fresh index. Fresh failures propagate; commit/ref publication is outside
+the retry. Capture finalization removes temporary index and lock files.
+
+Reuse is conservative: custom filter configuration (including global filters) and
+special index modes select fresh capture. Metadata validation scans tracked paths
+and attributes before and after capture; it is not an atomic filesystem snapshot
+and does not eliminate metadata ABA races. A single entry can be evicted by another
+worktree. First captures, misses and heavily dirty trees can still require expensive
+Git staging. Clean synthetic repeat-capture timings do not establish first-capture
+latency or universal real-session speedups.
+
 Each turn is bracketed by workspace checkpoints so diffs and reverts are exact. `CheckpointStore`
 captures state as hidden Git refs through the VCS driver's checkpoint operations;
 `CheckpointDiffQuery` answers turn and full-thread diff requests; `CheckpointReactor` coordinates
