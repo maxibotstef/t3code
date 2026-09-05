@@ -2231,6 +2231,173 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("expand-full converges after interruption before the atomic state rename", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "interrupted-state-rename",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/interrupted-state-rename",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-INTERRUPT-RENAME",
+            taskSlug: "interrupted-state-rename",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        const before = yield* fileSystem.readFileString(statePath);
+        let failRename = true;
+        const interruptedFileSystem = FileSystem.make({
+          ...fileSystem,
+          rename: (fromPath, toPath) => {
+            if (failRename && toPath === statePath) {
+              failRename = false;
+              return Effect.fail(
+                PlatformError.systemError({
+                  _tag: "Unknown",
+                  module: "FileSystem",
+                  method: "rename",
+                  description: "injected interruption before state rename",
+                }),
+              );
+            }
+            return fileSystem.rename(fromPath, toPath);
+          },
+        });
+        const interruptedDriver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(FileSystem.FileSystem, interruptedFileSystem),
+          Effect.provide(ServerConfigLayer),
+        );
+
+        assert.equal(
+          (yield* Effect.result(
+            interruptedDriver.expandWorktreeMaterializationFull(
+              worktreePath,
+              "interrupted-before-state-rename",
+            ),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(yield* fileSystem.readFileString(statePath), before);
+        assert.equal(
+          yield* git(worktreePath, ["config", "--bool", "core.sparseCheckout"]),
+          "false",
+        );
+        assert.equal(
+          (yield* Effect.result(driver.verifyWorktreeMaterialization(worktreePath)))._tag,
+          "Failure",
+        );
+
+        const retried = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "retry-after-state-rename-interruption",
+        );
+        assert.equal(retried.effectiveProfileId, "full");
+        assert.equal((yield* driver.verifyWorktreeMaterialization(worktreePath)).mode, "full");
+      }),
+    );
+
+    it.effect("expand-full leaves a recoverable full state when verification is interrupted", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const { expectedContractSha256 } = yield* writeMaterializationFixture(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "interrupted-verification",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/interrupted-verification",
+          materialization: {
+            requestedProfileId: "governance-review",
+            expectedContractSha256,
+            taskId: "OC-INTERRUPT-VERIFY",
+            taskSlug: "interrupted-verification",
+            taskCardPath: "ops/stef-task/task/stef-task.json",
+            scopePaths: ["docs/spec.md"],
+            taskClasses: ["source-task"],
+          },
+        });
+        const gitDir = yield* git(worktreePath, ["rev-parse", "--git-dir"]);
+        const statePath = pathService.join(
+          pathService.resolve(worktreePath, gitDir),
+          "worktree-materialization.json",
+        );
+        let stateRenamed = false;
+        let failRead = true;
+        const interruptedFileSystem = FileSystem.make({
+          ...fileSystem,
+          rename: (fromPath, toPath) =>
+            fileSystem.rename(fromPath, toPath).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (toPath === statePath) stateRenamed = true;
+                }),
+              ),
+            ),
+          readFile: (filePath: string) => {
+            if (stateRenamed && failRead && filePath === statePath) {
+              failRead = false;
+              return Effect.fail(
+                PlatformError.systemError({
+                  _tag: "Unknown",
+                  module: "FileSystem",
+                  method: "readFile",
+                  description: "injected interruption before verification",
+                }),
+              );
+            }
+            return fileSystem.readFile(filePath);
+          },
+        });
+        const interruptedDriver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(FileSystem.FileSystem, interruptedFileSystem),
+          Effect.provide(ServerConfigLayer),
+        );
+
+        assert.equal(
+          (yield* Effect.result(
+            interruptedDriver.expandWorktreeMaterializationFull(
+              worktreePath,
+              "interrupted-before-verification",
+            ),
+          ))._tag,
+          "Failure",
+        );
+        const persisted = yield* driver.verifyWorktreeMaterialization(worktreePath);
+        assert.equal(persisted.effectiveProfileId, "full");
+        const retried = yield* driver.expandWorktreeMaterializationFull(
+          worktreePath,
+          "retry-after-verification-interruption",
+        );
+        assert.equal(retried.effectiveProfileId, "full");
+      }),
+    );
+
     it.effect("expand-full refuses failed source identity and branch setup states", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
