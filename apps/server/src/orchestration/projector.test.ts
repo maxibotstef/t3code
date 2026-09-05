@@ -1,3 +1,4 @@
+import { it as effectIt } from "@effect/vitest";
 import {
   CommandId,
   EventId,
@@ -106,10 +107,10 @@ describe("orchestration projector", () => {
     ]);
   });
 
-  it("applies server-owned thread materialization events", async () => {
-    const now = "2026-01-01T00:00:00.000Z";
-    const created = await Effect.runPromise(
-      projectEvent(
+  effectIt.effect("applies server-owned thread materialization events", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const created = yield* projectEvent(
         createEmptyReadModel(now),
         makeEvent({
           sequence: 1,
@@ -130,24 +131,22 @@ describe("orchestration projector", () => {
             updatedAt: now,
           },
         }),
-      ),
-    );
-    const sparse = {
-      ...FULL_WORKTREE_MATERIALIZATION_STATE,
-      requestedProfileId: "governance-review",
-      effectiveProfileId: "governance-review",
-      mode: "sparse" as const,
-      reason: null,
-      expectedContractSha256: "a".repeat(64),
-      contractSha256: "a".repeat(64),
-      manifestSha256: "b".repeat(64),
-      conePaths: ["docs"],
-      requiredPaths: ["docs/spec.md"],
-      taskId: "OC-1",
-      taskSlug: "demo",
-    };
-    const next = await Effect.runPromise(
-      projectEvent(
+      );
+      const sparse = {
+        ...FULL_WORKTREE_MATERIALIZATION_STATE,
+        requestedProfileId: "governance-review",
+        effectiveProfileId: "governance-review",
+        mode: "sparse" as const,
+        reason: null,
+        expectedContractSha256: "a".repeat(64),
+        contractSha256: "a".repeat(64),
+        manifestSha256: "b".repeat(64),
+        conePaths: ["docs"],
+        requiredPaths: ["docs/spec.md"],
+        taskId: "OC-1",
+        taskSlug: "demo",
+      };
+      const next = yield* projectEvent(
         created,
         makeEvent({
           sequence: 2,
@@ -162,10 +161,10 @@ describe("orchestration projector", () => {
             updatedAt: now,
           },
         }),
-      ),
-    );
-    expect(next.threads[0]?.materialization).toEqual(sparse);
-  });
+      );
+      expect(next.threads[0]?.materialization).toEqual(sparse);
+    }),
+  );
 
   it("fails when event payload cannot be decoded by runtime schema", async () => {
     const now = "2026-01-01T00:00:00.000Z";
