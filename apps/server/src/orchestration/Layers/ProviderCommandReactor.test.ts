@@ -180,14 +180,18 @@ describe("ProviderCommandReactor", () => {
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
+    readonly createWorktreeEffect?: (
+      worktreeInput: Parameters<
+        GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]
+      >[0],
+    ) => ReturnType<GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]>;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
     readonly tryHandlePromptCommandEffect?: ProviderAuthService["Service"]["tryHandlePromptCommand"];
-    readonly verifyWorktreeMaterializationEffect?: () => Effect.Effect<
-      VcsWorktreeMaterializationState,
-      GitCommandError
-    >;
+    readonly verifyWorktreeMaterializationEffect?: (
+      cwd: string,
+    ) => Effect.Effect<VcsWorktreeMaterializationState, GitCommandError>;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -309,12 +313,19 @@ describe("ProviderCommandReactor", () => {
     );
     const pruneWorktrees = vi.fn((_: { readonly cwd: string }) => Effect.void);
     const createWorktree = vi.fn(
-      (input: Parameters<GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]>[0]) =>
-        Effect.succeed({ worktree: { path: input.path ?? "", refName: input.refName } }),
+      (
+        worktreeInput: Parameters<
+          GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]
+        >[0],
+      ) =>
+        input?.createWorktreeEffect?.(worktreeInput) ??
+        Effect.succeed({
+          worktree: { path: worktreeInput.path ?? "", refName: worktreeInput.refName },
+        }),
     );
     const verifyWorktreeMaterialization = vi.fn(
-      () =>
-        input?.verifyWorktreeMaterializationEffect?.() ??
+      (cwd: string) =>
+        input?.verifyWorktreeMaterializationEffect?.(cwd) ??
         Effect.succeed(FULL_WORKTREE_MATERIALIZATION_STATE),
     );
     const refreshStatus = vi.fn((_: string) =>
@@ -2250,8 +2261,32 @@ describe("ProviderCommandReactor", () => {
       taskClasses: ["source-task"],
       includeResearchTask: true,
     };
+    const recreatedMaterialization = {
+      ...sparseMaterialization,
+      baseSha: "c".repeat(40),
+      manifestSha256: "d".repeat(64),
+      reason: "rehydrated-effective-profile",
+    };
+    let createdMaterialization: VcsWorktreeMaterializationState | null = null;
     const harness = await createHarness({
-      verifyWorktreeMaterializationEffect: () => Effect.succeed(sparseMaterialization),
+      createWorktreeEffect: (worktreeInput) => {
+        createdMaterialization = recreatedMaterialization;
+        return Effect.succeed({
+          worktree: { path: worktreeInput.path ?? "", refName: worktreeInput.refName },
+          materialization: recreatedMaterialization,
+        });
+      },
+      verifyWorktreeMaterializationEffect: () =>
+        createdMaterialization
+          ? Effect.succeed(createdMaterialization)
+          : Effect.fail(
+              new GitCommandError({
+                operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                command: "git",
+                cwd: worktreePath,
+                detail: "worktree was not recreated",
+              }),
+            ),
     });
     const now = "2026-01-01T00:00:00.000Z";
     const worktreePath = NodePath.join(harness.stateDir, "missing-sparse-worktree");
@@ -2318,6 +2353,109 @@ describe("ProviderCommandReactor", () => {
     expect(harness.verifyWorktreeMaterialization.mock.invocationCallOrder[0]).toBeLessThan(
       harness.startSession.mock.invocationCallOrder[0]!,
     );
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(recreatedMaterialization);
+  });
+
+  it("rehydrates a prior sparse fallback as full and persists the recreated identity", async () => {
+    const fallbackMaterialization: VcsWorktreeMaterializationState = {
+      ...FULL_WORKTREE_MATERIALIZATION_STATE,
+      requestedProfileId: "governance-review",
+      reason: "sparse-setup-failed",
+      expectedContractSha256: "a".repeat(64),
+      contractSha256: "a".repeat(64),
+      taskId: "OC-FALLBACK",
+      taskSlug: "fallback-rehydrate",
+      taskCardPath: "ops/stef-task/fallback-rehydrate/stef-task.json",
+      scopePaths: ["docs/spec.md"],
+      taskClasses: ["source-task"],
+      baseSha: "b".repeat(40),
+    };
+    const recreatedMaterialization: VcsWorktreeMaterializationState = {
+      ...fallbackMaterialization,
+      requestedProfileId: "full",
+      reason: "explicit-full",
+      baseSha: "c".repeat(40),
+    };
+    let createdMaterialization: VcsWorktreeMaterializationState | null = null;
+    const harness = await createHarness({
+      createWorktreeEffect: (worktreeInput) => {
+        createdMaterialization = recreatedMaterialization;
+        return Effect.succeed({
+          worktree: { path: worktreeInput.path ?? "", refName: worktreeInput.refName },
+          materialization: recreatedMaterialization,
+        });
+      },
+      verifyWorktreeMaterializationEffect: () =>
+        createdMaterialization
+          ? Effect.succeed(createdMaterialization)
+          : Effect.fail(
+              new GitCommandError({
+                operation: "GitVcsDriver.verifyWorktreeMaterialization",
+                command: "git",
+                cwd: "/missing",
+                detail: "worktree was not recreated",
+              }),
+            ),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const worktreePath = NodePath.join(harness.stateDir, "missing-fallback-worktree");
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-missing-fallback-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "feature/fallback-restore",
+        worktreePath,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.materialization.set",
+        commandId: CommandId.make("cmd-thread-fallback-materialization"),
+        threadId: ThreadId.make("thread-1"),
+        materialization: fallbackMaterialization,
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-missing-fallback-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-missing-fallback-worktree"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.createWorktree).toHaveBeenCalledWith({
+      cwd: "/tmp/provider-project",
+      refName: "feature/fallback-restore",
+      path: worktreePath,
+      materialization: {
+        requestedProfileId: "full",
+        expectedContractSha256: "a".repeat(64),
+        taskId: "OC-FALLBACK",
+        taskSlug: "fallback-rehydrate",
+        taskCardPath: "ops/stef-task/fallback-rehydrate/stef-task.json",
+        scopePaths: ["docs/spec.md"],
+        taskClasses: ["source-task"],
+      },
+    });
+    expect(
+      (await harness.readModel()).threads.find((entry) => entry.id === ThreadId.make("thread-1"))
+        ?.materialization,
+    ).toEqual(recreatedMaterialization);
   });
 
   it("accepts legacy full materialization before a worktree turn", async () => {

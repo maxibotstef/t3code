@@ -11,6 +11,7 @@ import {
   type ProviderSession,
   type OrchestrationThread,
   FULL_WORKTREE_MATERIALIZATION_STATE,
+  type VcsWorktreeMaterializationRequest,
   type RuntimeMode,
   type TurnId,
 } from "@t3tools/contracts";
@@ -488,13 +489,16 @@ const make = Effect.gen(function* () {
    * Recreation is best-effort; the mandatory verifier blocks the turn if the
    * restored path is absent or does not match the persisted materialization.
    */
-  const ensureThreadWorktree = Effect.fnUntraced(function* (thread: {
-    readonly id: ThreadId;
-    readonly projectId: ProjectId;
-    readonly branch: string | null;
-    readonly worktreePath: string | null;
-    readonly materialization?: OrchestrationThread["materialization"];
-  }) {
+  const ensureThreadWorktree = Effect.fnUntraced(function* (
+    thread: {
+      readonly id: ThreadId;
+      readonly projectId: ProjectId;
+      readonly branch: string | null;
+      readonly worktreePath: string | null;
+      readonly materialization?: OrchestrationThread["materialization"];
+    },
+    createdAt: string,
+  ) {
     const { worktreePath, branch } = thread;
     if (!worktreePath || !branch) {
       return;
@@ -517,13 +521,18 @@ const make = Effect.gen(function* () {
     // that makes `git worktree add` refuse the path; prune clears it.
     const persistedMaterialization = thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE;
     const taskCardPath = persistedMaterialization.taskCardPath ?? null;
-    const sparseRehydration =
-      persistedMaterialization.effectiveProfileId !== "full" &&
+    const hasNonDefaultIdentity = !Equal.equals(
+      persistedMaterialization,
+      FULL_WORKTREE_MATERIALIZATION_STATE,
+    );
+    const rehydrationMaterialization =
+      hasNonDefaultIdentity &&
       persistedMaterialization.expectedContractSha256 &&
       persistedMaterialization.taskId &&
       persistedMaterialization.taskSlug &&
-      taskCardPath
-        ? {
+      taskCardPath &&
+      persistedMaterialization.scopePaths?.length
+        ? ({
             requestedProfileId: persistedMaterialization.effectiveProfileId,
             expectedContractSha256: persistedMaterialization.expectedContractSha256,
             taskId: persistedMaterialization.taskId,
@@ -536,15 +545,26 @@ const make = Effect.gen(function* () {
             ...(persistedMaterialization.includeResearchTask === true
               ? { includeResearchTask: true }
               : {}),
-          }
+          } satisfies VcsWorktreeMaterializationRequest)
         : undefined;
-    yield* gitWorkflow.pruneWorktrees({ cwd }).pipe(
+    if (hasNonDefaultIdentity && !rehydrationMaterialization) {
+      yield* Effect.logWarning(
+        "provider command reactor cannot recreate worktree with incomplete materialization identity",
+        {
+          threadId: thread.id,
+          worktreePath,
+          effectiveProfileId: persistedMaterialization.effectiveProfileId,
+        },
+      );
+      return;
+    }
+    const recreated = yield* gitWorkflow.pruneWorktrees({ cwd }).pipe(
       Effect.andThen(
         gitWorkflow.createWorktree({
           cwd,
           refName: branch,
           path: worktreePath,
-          ...(sparseRehydration ? { materialization: sparseRehydration } : {}),
+          ...(rehydrationMaterialization ? { materialization: rehydrationMaterialization } : {}),
         }),
       ),
       Effect.catchCause((cause) =>
@@ -554,9 +574,33 @@ const make = Effect.gen(function* () {
               threadId: thread.id,
               worktreePath,
               cause: Cause.pretty(cause),
-            }),
+            }).pipe(Effect.as(null)),
       ),
     );
+    const recreatedMaterialization = recreated?.materialization;
+    if (!rehydrationMaterialization || !recreatedMaterialization) return;
+    if (
+      recreatedMaterialization.effectiveProfileId !== persistedMaterialization.effectiveProfileId
+    ) {
+      yield* Effect.logWarning(
+        "provider command reactor recreated worktree with a different effective materialization",
+        {
+          threadId: thread.id,
+          worktreePath,
+          persistedEffectiveProfileId: persistedMaterialization.effectiveProfileId,
+          recreatedEffectiveProfileId: recreatedMaterialization.effectiveProfileId,
+        },
+      );
+      return;
+    }
+    yield* orchestrationEngine.dispatch({
+      type: "thread.materialization.set",
+      commandId: yield* serverCommandId("rehydrate-thread-materialization-set"),
+      threadId: thread.id,
+      materialization: recreatedMaterialization,
+      createdAt,
+    });
+    return recreatedMaterialization;
   });
 
   const resolveThread = Effect.fnUntraced(function* (threadId: ThreadId) {
@@ -1317,7 +1361,7 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    yield* ensureThreadWorktree(thread);
+    const recreatedMaterialization = yield* ensureThreadWorktree(thread, event.payload.createdAt);
 
     const materializationReady = yield* Effect.gen(function* () {
       if (!thread.worktreePath) return true;
@@ -1325,7 +1369,7 @@ const make = Effect.gen(function* () {
       if (
         !Equal.equals(
           materialization,
-          thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE,
+          recreatedMaterialization ?? thread.materialization ?? FULL_WORKTREE_MATERIALIZATION_STATE,
         )
       ) {
         return yield* new ProviderAdapterRequestError({
