@@ -247,18 +247,18 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         for (const input of [{}, { label: "Synthetic phone" }]) {
           const issued = yield* grants.issueOneTimeToken(input);
           const change = yield* Queue.take(changes);
-          expect(yield* Schema.encodeEffect(Schema.UnknownFromJsonString)(change)).not.toContain(
-            "desktop-attach-token",
-          );
+          expect(
+            yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(change),
+          ).not.toContain("desktop-attach-token");
           expect(change?.type).toBe("pairingLinkUpserted");
           if (change?.type !== "pairingLinkUpserted")
             throw new Error("Expected a pairing link update");
           expect(change.pairingLink.id).toBe(issued.id);
           expect(change.pairingLink).not.toHaveProperty("credential");
           const active = yield* grants.listActive();
-          expect(yield* Schema.encodeEffect(Schema.UnknownFromJsonString)(active)).not.toContain(
-            "desktop-attach-token",
-          );
+          expect(
+            yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(active),
+          ).not.toContain("desktop-attach-token");
           const listed = active.find((link) => link.id === issued.id);
           expect(listed).toEqual(change.pairingLink);
           const consumed = yield* grants.consume(issued.credential);
