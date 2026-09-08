@@ -107,7 +107,30 @@ export const refreshAttachedBackend = Effect.fn("desktop.refreshAttachedBackend"
       discovered._tag === "Attach" &&
       discovered.target.environmentId === input.expectedEnvironmentId
     ) {
-      yield* attachment.setReady(discovered.target);
+      const current = yield* attachment.current;
+      if (
+        Option.isNone(current) ||
+        !current.value.ready ||
+        current.value.target.httpBaseUrl !== discovered.target.httpBaseUrl
+      ) {
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+          const targetOrigin = yield* activateAttachedBackend(discovered.target);
+          yield* desktopWindow.handleBackendReady(targetOrigin);
+        }).pipe(
+          Effect.catchCause((cause) =>
+            attachment
+              .markUnready(input.expectedEnvironmentId)
+              .pipe(
+                Effect.andThen(
+                  logBootstrapWarning("failed to refresh attached backend", { cause }),
+                ),
+              ),
+          ),
+        );
+      } else {
+        yield* attachment.setReady(discovered.target);
+      }
       return;
     }
     yield* attachment.markUnready(input.expectedEnvironmentId);

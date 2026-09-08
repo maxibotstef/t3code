@@ -2,6 +2,9 @@ import * as Schema from "effect/Schema";
 
 import { EnvironmentId } from "./baseSchemas.ts";
 
+// Shared by the owner grant and Desktop discovery so an expired grant is never offered.
+export const DESKTOP_ATTACH_CREDENTIAL_TTL_MS = 24 * 60 * 60 * 1_000;
+
 export const PersistedServerRuntimeState = Schema.Struct({
   version: Schema.Literal(1),
   pid: Schema.Int,

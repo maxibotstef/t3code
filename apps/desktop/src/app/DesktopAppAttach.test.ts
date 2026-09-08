@@ -27,7 +27,12 @@ import { getLocalEnvironmentBootstraps } from "../ipc/methods/window.ts";
 import * as PreviewManager from "../preview/Manager.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopState from "./DesktopState.ts";
-import { bootstrap, refreshAttachedBackend, resolveDesktopBackendLaunch } from "./DesktopApp.ts";
+import {
+  activateAttachedBackend,
+  bootstrap,
+  refreshAttachedBackend,
+  resolveDesktopBackendLaunch,
+} from "./DesktopApp.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 import * as DesktopWslBackend from "../wsl/DesktopWslBackend.ts";
 
@@ -57,7 +62,7 @@ const writeAttach = (stateDir: string, credential: string) =>
       environmentId: ENVIRONMENT_ID,
       serverVersion: DESKTOP_VERSION,
       credential,
-      createdAt: "2026-09-04T00:00:00.000Z",
+      createdAt: "1970-01-01T00:00:00.000Z",
     })}\n`,
     { mode: 0o600 },
   );
@@ -260,6 +265,8 @@ describe("Desktop attach recovery", () => {
 
   it.effect("marks owner loss unready and re-reads the rotated credential on recovery", () => {
     primaryStartCount = 0;
+    const protocolOrigins: string[] = [];
+    const readyOrigins: string[] = [];
     const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-attach-recovery-"));
     writeRuntime(stateDir, process.pid);
     writeAttach(stateDir, "initial-credential");
@@ -269,7 +276,7 @@ describe("Desktop attach recovery", () => {
       const initial = yield* discoverDesktopBackend({ stateDir, desktopVersion: DESKTOP_VERSION });
       assert.equal(initial._tag, "Attach");
       if (initial._tag !== "Attach") return;
-      yield* attachment.setReady(initial.target);
+      yield* activateAttachedBackend(initial.target);
 
       writeRuntime(stateDir, 4_194_305);
       yield* refreshAttachedBackend({
@@ -308,6 +315,40 @@ describe("Desktop attach recovery", () => {
       assert.equal(recoveredBootstraps[0]?.bootstrapToken, "rotated-credential");
       assert.equal(recoveredBootstraps[0]?.httpBaseUrl, "http://127.0.0.1:49732/");
       assert.equal(primaryStartCount, 0);
-    }).pipe(Effect.provide(testLayer));
+      assert.deepEqual(protocolOrigins, ["http://127.0.0.1:49731", "http://127.0.0.1:49732"]);
+      assert.deepEqual(readyOrigins, ["http://127.0.0.1:49732"]);
+      yield* refreshAttachedBackend({
+        stateDir,
+        desktopVersion: DESKTOP_VERSION,
+        expectedEnvironmentId: ENVIRONMENT_ID,
+      });
+      assert.equal(protocolOrigins.length, 2);
+      assert.equal(readyOrigins.length, 1);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          testLayer,
+          Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
+            isDevelopment: false,
+          } as DesktopEnvironment.DesktopEnvironment["Service"]),
+          Layer.succeed(
+            ElectronProtocol.ElectronProtocol,
+            ElectronProtocol.ElectronProtocol.of({
+              registerDesktopProtocol: (input) =>
+                Effect.sync(() => {
+                  protocolOrigins.push(input.targetOrigin.origin);
+                }),
+            }),
+          ),
+          Layer.succeed(DesktopWindow.DesktopWindow, {
+            handleBackendReady: (origin: URL) =>
+              Effect.sync(() => {
+                readyOrigins.push(origin.origin);
+              }),
+          } as unknown as DesktopWindow.DesktopWindow["Service"]),
+        ),
+      ),
+      Effect.scoped,
+    );
   });
 });

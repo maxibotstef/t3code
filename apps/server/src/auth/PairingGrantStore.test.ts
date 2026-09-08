@@ -18,7 +18,10 @@ import * as PairingGrantStore from "./PairingGrantStore.ts";
 
 const makeServerConfigLayer = (
   overrides?: Partial<
-    Pick<ServerConfig.ServerConfig["Service"], "desktopAttachCredential" | "desktopBootstrapToken">
+    Pick<
+      ServerConfig.ServerConfig["Service"],
+      "desktopAttachCredential" | "desktopAttachCredentialCreatedAt" | "desktopBootstrapToken"
+    >
   >,
 ) =>
   Layer.effect(
@@ -36,7 +39,10 @@ const makeServerConfigLayer = (
 
 const makePairingGrantStoreLayer = (
   overrides?: Partial<
-    Pick<ServerConfig.ServerConfig["Service"], "desktopAttachCredential" | "desktopBootstrapToken">
+    Pick<
+      ServerConfig.ServerConfig["Service"],
+      "desktopAttachCredential" | "desktopAttachCredentialCreatedAt" | "desktopBootstrapToken"
+    >
   >,
 ) =>
   PairingGrantStore.layer.pipe(
@@ -219,7 +225,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         "relay:read",
       ]);
       expect(second.subject).toBe("desktop-attach");
-      yield* TestClock.adjust(Duration.hours(25));
+      yield* TestClock.adjust(Duration.hours(23));
       const expired = yield* Effect.flip(bootstrapCredentials.consume("desktop-attach-token"));
       expect(expired._tag).toBe("ExpiredBootstrapCredentialError");
     }).pipe(
@@ -227,6 +233,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         Layer.merge(
           makePairingGrantStoreLayer({
             desktopAttachCredential: "desktop-attach-token",
+            desktopAttachCredentialCreatedAt: -Duration.toMillis(Duration.hours(1)),
           }),
           TestClock.layer(),
         ),

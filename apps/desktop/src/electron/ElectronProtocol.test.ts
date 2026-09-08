@@ -88,6 +88,36 @@ describe("ElectronProtocol", () => {
     }).pipe(Effect.provide(ElectronProtocol.layer)),
   );
 
+  it.effect("updates the existing proxy handler when an attached owner changes port", () =>
+    Effect.gen(function* () {
+      let handler: ((request: Request) => Promise<Response>) | undefined;
+      handleMock.mockImplementation((_scheme, nextHandler) => {
+        handler = nextHandler;
+      });
+      netFetchMock.mockImplementation(() => Promise.resolve(new Response("ok")));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const protocol = yield* ElectronProtocol.ElectronProtocol;
+          for (const port of [49731, 49732]) {
+            yield* protocol.registerDesktopProtocol({
+              scheme: "t3code",
+              targetOrigin: new URL(`http://127.0.0.1:${port}/`),
+              backendOrigin: new URL(`http://127.0.0.1:${port}/`),
+              clerkFrontendApiHostname: undefined,
+            });
+            yield* Effect.promise(() => handler!(new Request("t3code://app/api/health")));
+          }
+          assert.equal(handleMock.mock.calls.length, 1);
+          assert.deepEqual(
+            netFetchMock.mock.calls.map((call) => call[0]),
+            ["http://127.0.0.1:49731/api/health", "http://127.0.0.1:49732/api/health"],
+          );
+        }),
+      );
+      assert.deepEqual(unhandleMock.mock.calls, [["t3code"]]);
+    }).pipe(Effect.provide(ElectronProtocol.layer)),
+  );
+
   it.effect("rejects custom protocol requests for another host", () =>
     Effect.gen(function* () {
       let handler: ((request: Request) => Promise<Response>) | undefined;

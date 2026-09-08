@@ -572,7 +572,10 @@ export const persistActivatedServerRuntimeFiles = Effect.fn("server.persistActiv
   function* (input: {
     readonly config: Pick<
       ServerConfig.ServerConfig["Service"],
-      "desktopAttachCredential" | "serverAttachCredentialPath" | "serverRuntimeStatePath"
+      | "desktopAttachCredential"
+      | "desktopAttachCredentialCreatedAt"
+      | "serverAttachCredentialPath"
+      | "serverRuntimeStatePath"
     >;
     readonly state: PersistedServerRuntimeState;
   }) {
@@ -585,6 +588,9 @@ export const persistActivatedServerRuntimeFiles = Effect.fn("server.persistActiv
           environmentId: descriptor.environmentId,
           serverVersion: descriptor.serverVersion,
           credential: desktopAttachCredential,
+          ...(input.config.desktopAttachCredentialCreatedAt === undefined
+            ? {}
+            : { createdAt: input.config.desktopAttachCredentialCreatedAt }),
         });
         yield* persistServerAttachCredential({
           path: input.config.serverAttachCredentialPath,

@@ -61,13 +61,16 @@ export const makePersistedServerAttachCredential = (input: {
   readonly environmentId: PersistedServerAttachCredential["environmentId"];
   readonly serverVersion: string;
   readonly credential: string;
+  readonly createdAt?: number;
 }): Effect.Effect<PersistedServerAttachCredential> =>
   Effect.map(DateTime.now, (now) => ({
     version: 1,
     environmentId: input.environmentId,
     serverVersion: input.serverVersion,
     credential: input.credential,
-    createdAt: DateTime.formatIso(now),
+    createdAt: DateTime.formatIso(
+      input.createdAt === undefined ? now : DateTime.makeUnsafe(input.createdAt),
+    ),
   }));
 
 export const generateServerAttachCredential = Crypto.Crypto.pipe(

@@ -94,6 +94,7 @@ const writeAttach = (
     readonly environmentId: string;
     readonly serverVersion: string;
     readonly credential: string;
+    readonly createdAt: string;
   }> = {},
 ) => {
   NodeFS.writeFileSync(
@@ -103,7 +104,7 @@ const writeAttach = (
       environmentId: ENVIRONMENT_ID,
       serverVersion: DESKTOP_VERSION,
       credential: "fresh-attach-credential",
-      createdAt: "2026-09-04T00:00:00.000Z",
+      createdAt: "1970-01-01T00:00:00.000Z",
       ...overrides,
     })}\n`,
     { mode: 0o600 },
@@ -141,6 +142,27 @@ describe("DesktopBackendDiscovery", () => {
       assert.equal(result.target.credential, "fresh-attach-credential");
     });
   });
+
+  for (const occupied of [false, true]) {
+    for (const [createdAt, expected] of [
+      ["1969-12-31T00:00:00.001Z", "Attach"],
+      ["1969-12-31T00:00:00.000Z", "Refuse"],
+      ["1969-12-30T23:00:00.000Z", "Refuse"],
+      ["invalid-time", "Refuse"],
+    ] as const) {
+      it.effect(`checks credential lifetime at ${createdAt} with occupied=${occupied}`, () => {
+        const stateDir = makeStateDir();
+        writeRuntime(stateDir);
+        writeAttach(stateDir, { createdAt });
+        return Effect.gen(function* () {
+          const result = yield* discover({ stateDir, occupied });
+          assert.equal(result._tag, expected);
+          if (result._tag === "Refuse")
+            assert.equal(result.error.reason, "attach-credential-unavailable");
+        });
+      });
+    }
+  }
 
   const refusals: ReadonlyArray<{
     readonly name: string;

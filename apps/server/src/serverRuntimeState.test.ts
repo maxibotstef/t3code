@@ -77,8 +77,10 @@ describe("serverRuntimeState", () => {
         environmentId: EnvironmentId.make("attach-environment"),
         serverVersion: "0.0.37-nightly.20260904",
         credential: "attach-credential",
+        createdAt: 1_000,
       });
 
+      assert.equal(state.createdAt, "1970-01-01T00:00:01.000Z");
       yield* ServerRuntimeState.persistServerAttachCredential({ path: statePath, state });
       const restored = yield* ServerRuntimeState.readPersistedServerAttachCredential(statePath);
       const info = yield* fileSystem.stat(statePath);

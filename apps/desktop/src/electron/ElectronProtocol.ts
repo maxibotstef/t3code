@@ -207,19 +207,24 @@ async function fetchWithTransientRetry(url: string, init: RequestInit): Promise<
 
 export const make = Effect.gen(function* () {
   const registered = yield* Ref.make(false);
+  let currentTarget: { targetOrigin: URL; contentSecurityPolicy: string } | undefined;
 
   const registerDesktopProtocol = Effect.fn("desktop.electron.protocol.registerDesktopProtocol")(
     function* (input: DesktopProtocolRegistrationInput) {
+      const target = {
+        targetOrigin: input.targetOrigin,
+        contentSecurityPolicy: makeDesktopContentSecurityPolicy(input),
+      };
+      currentTarget = target;
       if (yield* Ref.get(registered)) return;
-
-      const contentSecurityPolicy = makeDesktopContentSecurityPolicy(input);
 
       yield* Effect.acquireRelease(
         Effect.try({
           try: () => {
-            Electron.protocol.handle(input.scheme, (request) =>
-              proxyRequest(request, input.targetOrigin, contentSecurityPolicy),
-            );
+            Electron.protocol.handle(input.scheme, (request) => {
+              const active = currentTarget ?? target;
+              return proxyRequest(request, active.targetOrigin, active.contentSecurityPolicy);
+            });
           },
           catch: (cause) => new ElectronProtocolRegistrationError({ scheme: input.scheme, cause }),
         }).pipe(Effect.andThen(Ref.set(registered, true))),

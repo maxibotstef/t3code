@@ -1,4 +1,5 @@
 import {
+  DESKTOP_ATTACH_CREDENTIAL_TTL_MS,
   ExecutionEnvironmentDescriptor,
   PersistedServerAttachCredential,
   PersistedServerRuntimeState,
@@ -8,6 +9,7 @@ import {
   type PersistedServerRuntimeState as PersistedServerRuntimeStateValue,
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -53,7 +55,7 @@ export class DesktopBackendDiscoveryRefusedError extends Schema.TaggedErrorClass
       case "version-mismatch":
         return `The live T3 Code owner version (${this.serverVersion ?? "unknown"}) does not exactly match this Desktop version (${this.desktopVersion ?? "unknown"}).`;
       case "attach-credential-unavailable":
-        return "The live T3 Code owner predates Desktop attach or its server-attach.json is missing, unreadable, or malformed.";
+        return "The live T3 Code owner predates Desktop attach or its server-attach.json is missing, unreadable, malformed, or expired. Restart the owning backend before attaching.";
       case "owner-origin-unreachable":
         return `A live process owns this T3 home, but its recorded origin ${this.origin ?? "is unknown"} is unreachable.`;
       case "default-port-occupied-without-owner":
@@ -158,16 +160,15 @@ const isDefaultDesktopPortAvailable = Effect.fn("desktop.backendDiscovery.defaul
 );
 
 const classifyNoLiveOwner = isDefaultDesktopPortAvailable().pipe(
-  Effect.map(
-    (available): DesktopBackendDiscoveryResult =>
-      available
-        ? { _tag: "Spawn", port: DEFAULT_DESKTOP_BACKEND_PORT }
-        : {
-            _tag: "Refuse",
-            error: new DesktopBackendDiscoveryRefusedError({
-              reason: "default-port-occupied-without-owner",
-            }),
-          },
+  Effect.map((available): DesktopBackendDiscoveryResult =>
+    available
+      ? { _tag: "Spawn", port: DEFAULT_DESKTOP_BACKEND_PORT }
+      : {
+          _tag: "Refuse",
+          error: new DesktopBackendDiscoveryRefusedError({
+            reason: "default-port-occupied-without-owner",
+          }),
+        },
   ),
 );
 
@@ -214,6 +215,17 @@ export const discoverDesktopBackend = Effect.fn("desktop.backendDiscovery.discov
       decodeAttachCredential,
     );
     if (Option.isNone(attachCredential)) {
+      return {
+        _tag: "Refuse",
+        error: new DesktopBackendDiscoveryRefusedError({
+          reason: "attach-credential-unavailable",
+          origin: runtimeState.value.origin,
+        }),
+      };
+    }
+    const createdAt = Date.parse(attachCredential.value.createdAt);
+    const now = yield* Clock.currentTimeMillis;
+    if (!Number.isFinite(createdAt) || now >= createdAt + DESKTOP_ATTACH_CREDENTIAL_TTL_MS) {
       return {
         _tag: "Refuse",
         error: new DesktopBackendDiscoveryRefusedError({

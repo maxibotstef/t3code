@@ -1,6 +1,7 @@
 import {
   AuthAdministrativeScopes,
   AuthStandardClientScopes,
+  DESKTOP_ATTACH_CREDENTIAL_TTL_MS,
   type AuthEnvironmentScope,
   type AuthPairingLink,
   type ServerAuthBootstrapMethod,
@@ -330,13 +331,16 @@ export const make = Effect.gen(function* () {
   }
 
   if (config.desktopAttachCredential) {
-    const now = yield* DateTime.now;
+    const now =
+      config.desktopAttachCredentialCreatedAt === undefined
+        ? yield* DateTime.now
+        : DateTime.makeUnsafe(config.desktopAttachCredentialCreatedAt);
     yield* seedGrant(config.desktopAttachCredential, {
       method: "desktop-bootstrap",
       scopes: AuthStandardClientScopes,
       subject: "desktop-attach",
       expiresAt: DateTime.add(now, {
-        milliseconds: Duration.toMillis(DESKTOP_BOOTSTRAP_TTL_HOURS),
+        milliseconds: DESKTOP_ATTACH_CREDENTIAL_TTL_MS,
       }),
       remainingUses: "unbounded",
     });

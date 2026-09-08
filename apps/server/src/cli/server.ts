@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import { Command, GlobalFlag } from "effect/unstable/cli";
 
@@ -16,9 +17,14 @@ export const runServerCommand = (
   Effect.gen(function* () {
     const logLevel = yield* GlobalFlag.LogLevel;
     const config = yield* resolveServerConfig(flags, logLevel, options);
+    const desktopAttachCredentialCreatedAt = yield* Clock.currentTimeMillis;
     const desktopAttachCredential = yield* generateServerAttachCredential;
     return yield* runServer.pipe(
-      Effect.provideService(ServerConfig, { ...config, desktopAttachCredential }),
+      Effect.provideService(ServerConfig, {
+        ...config,
+        desktopAttachCredential,
+        desktopAttachCredentialCreatedAt,
+      }),
     );
   });
 
